@@ -68,11 +68,13 @@
     "postinstall": "node scripts/fix-pty-permissions.js",
     "typecheck": "tsc --noEmit",
     "make-icon": "node scripts/make-icon.js",
-    "compile-exe": "node scripts/compile-exe.js"
+    "compile-exe": "node scripts/compile-exe.js",
+    "test:memory": "esbuild src/main/memory/embeddingService.ts src/main/memory/memoryService.ts src/main/memory/vikingDb.ts --bundle --platform=node --format=cjs --external:@huggingface/transformers --outdir=scripts/.memtest && node scripts/verify-semantic-search.cjs"
   },
   "dependencies": {
     "@astron-team/skillhub": "^0.1.8",
     "@electron-toolkit/utils": "^4.0.0",
+    "@huggingface/transformers": "^4.2.0",
     "@larksuiteoapi/node-sdk": "^1.67.0",
     "@radix-ui/react-dialog": "^1.1.19",
     "class-variance-authority": "^0.7.1",
@@ -93,7 +95,9 @@
     "afterPack": "./scripts/after-pack-cleanup.js",
     "npmRebuild": false,
     "asarUnpack": [
-      "node_modules/sql.js/dist/*.wasm"
+      "node_modules/sql.js/dist/*.wasm",
+      "node_modules/onnxruntime-node/bin/**",
+      "node_modules/@huggingface/transformers/dist/**"
     ],
     "directories": {
       "output": "release",
@@ -121,8 +125,19 @@
         "to": "xueprompts.db"
       },
       {
+        "from": "resources/browser-guest-preload.js",
+        "to": "browser-guest-preload.js"
+      },
+      {
         "from": "build/pets",
         "to": "pets",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "resources/models",
+        "to": "models",
         "filter": [
           "**/*"
         ]

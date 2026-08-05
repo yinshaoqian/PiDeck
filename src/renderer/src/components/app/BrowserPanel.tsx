@@ -2,13 +2,16 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
 	ArrowLeft,
 	ArrowRight,
+	ExternalLink,
 	Home,
 	Maximize2,
 	Minus,
+	MousePointerClick,
 	Plus,
 	RefreshCw,
 	Smartphone,
 	Tablet,
+	TriangleAlert,
 	X,
 } from "lucide-react";
 import { t } from "../../i18n";
@@ -27,6 +30,15 @@ interface DevicePreset {
 	id: DeviceType;
 	label: string;
 	userAgent: string | null;
+}
+
+interface ConsoleErrorEntry {
+	id: number;
+	level: number; // 0 verbose / 1 info / 2 warning / 3 error
+	message: string;
+	sourceId?: string;
+	line?: number;
+	time: string;
 }
 
 const DEVICE_PRESETS: DevicePreset[] = [
@@ -49,6 +61,112 @@ let nextTabId = 1;
 function genTabId(): string {
 	return `tab-${nextTabId++}`;
 }
+
+/**
+ * 轻量 DOM 选择脚本（注入 webview）：hover 高亮圈选目标，点击确认后把
+ * 元素信息经 console.log("__LIGHTSELECT__"+JSON) 回传，由 BrowserPanel 捕获。
+ */
+const LIGHT_SELECT_SCRIPT = `
+(() => {
+  if (window.__lightSelectStop) { window.__lightSelectStop(); return; }
+  let current = null;
+  const genSelector = (el) => {
+    if (el.id) return "#" + CSS.escape(el.id);
+    const parts = [];
+    let node = el;
+    while (node && node !== document.body && node !== document.documentElement && parts.length < 5) {
+      let sel = node.tagName.toLowerCase();
+      // 仅目标元素附加一个短且稳定的 class（Tailwind 长类 / 含 / 与 : 的跳过）
+      if (node === el && typeof node.className === "string") {
+        const cls = node.className
+          .trim()
+          .split(/\s+/)
+          .find((c) => c.length <= 24 && !c.includes("/") && !c.includes(":"));
+        if (cls) sel += "." + CSS.escape(cls);
+      }
+      const parent = node.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter((c) => c.tagName === node.tagName);
+        if (siblings.length > 1) sel += ":nth-of-type(" + (siblings.indexOf(node) + 1) + ")";
+      }
+      parts.unshift(sel);
+      node = parent;
+    }
+    return parts.join(" > ");
+  };
+  const highlight = (el) => {
+    if (current) current.style.outline = "";
+    current = el;
+    if (el) el.style.outline = "2px solid #3b82f6";
+  };
+  const onMove = (e) => {
+    const t = e.target;
+    if (t === document.body || t === document.documentElement) { highlight(null); return; }
+    highlight(t);
+  };
+  const onClick = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const el = e.target;
+    const selector = genSelector(el);
+    const text = (el.innerText || el.textContent || "").trim().slice(0, 200);
+    const html = el.outerHTML.slice(0, 400);
+    window.__lightSelectStop();
+    // 结果写入 guest window 变量，由 BrowserPanel 通过 executeJavaScript 轮询读取
+    // （Electron webview 的 console-message 事件在 contextIsolation 下不可靠，弃用）
+    window.__lightSelectResult = { selector, tag: el.tagName.toLowerCase(), text, html };
+  };
+  window.__lightSelectStop = () => {
+    document.removeEventListener("mousemove", onMove, true);
+    document.removeEventListener("click", onClick, true);
+    if (current) current.style.outline = "";
+    window.__lightSelectStop = null;
+  };
+  document.addEventListener("mousemove", onMove, true);
+  document.addEventListener("click", onClick, true);
+})();
+`;
+
+/**
+ * 错误捕获脚本（注入 webview，常驻）：拦截 window.onerror / unhandledrejection /
+ * console.error/warn，写入 window.__pideckErrors，由 BrowserPanel 轮询读取。
+ * （Electron webview 的 console-message 事件在 contextIsolation 下不可靠，弃用）
+ */
+const ERROR_CAPTURE_SCRIPT = `
+(() => {
+  if (window.__pideckErrorHookInstalled) return;
+  window.__pideckErrorHookInstalled = true;
+  if (!window.__pideckErrors) window.__pideckErrors = [];
+  const cap = (level, message, sourceId, line) => {
+    const text = String(message || "").slice(0, 600);
+    if (!text) return;
+    window.__pideckErrors.push({
+      id: Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+      level,
+      message: text,
+      sourceId: sourceId || "",
+      line: line || 0,
+      time: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
+    });
+    if (window.__pideckErrors.length > 50) {
+      window.__pideckErrors.splice(0, window.__pideckErrors.length - 50);
+    }
+  };
+  window.addEventListener("error", (e) => {
+    const msg = e.message || (e.error && (e.error.stack || e.error.message)) || "";
+    cap(3, msg, e.filename || "", e.lineno || 0);
+  }, true);
+  window.addEventListener("unhandledrejection", (e) => {
+    const r = e.reason;
+    const msg = r instanceof Error ? (r.stack || r.message) : String(r);
+    cap(3, msg, "", 0);
+  }, true);
+  const origError = console.error;
+  const origWarn = console.warn;
+  console.error = function (...args) { cap(3, args.map(String).join(" "), "", 0); return origError.apply(console, args); };
+  console.warn = function (...args) { cap(2, args.map(String).join(" "), "", 0); return origWarn.apply(console, args); };
+})();
+`;
 
 /**
  * 浏览器状态要跨"抽屉模式/弹框模式"保留。
@@ -138,6 +256,17 @@ export function BrowserPanel(props: {
 	const [device, setDevice] = useState<DeviceType>(() => moduleState.device);
 	const [deviceMenuOpen, setDeviceMenuOpen] = useState(false);
 	const deviceMenuRef = useRef<HTMLDivElement | null>(null);
+	// 轻量 DOM 选择：注入 hover 高亮/点击选中脚本，选中后回填聊天输入框
+	const [lightSelectActive, setLightSelectActive] = useState(false);
+	const lightSelectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	// webview 错误捕获（注入拦截 + 轮询读取），保留最近 50 条
+	const [consoleErrors, setConsoleErrors] = useState<ConsoleErrorEntry[]>([]);
+	const [consolePanelOpen, setConsolePanelOpen] = useState(false);
+	const errorPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	// 弹出独立窗口后卸载侧边栏 webview（避免侧边栏/独立窗口双加载历史页面）
+	const [suspended, setSuspended] = useState(false);
+	// webview guest preload 路径（错误捕获最早阶段注入；就绪后才加载 src，保证 preload 先于页面执行）
+	const [guestPreload, setGuestPreload] = useState("");
 
 	const persistTabs = useCallback((nextTabs: TabEntry[], nextActiveId: string | null) => {
 		moduleState.tabs = nextTabs;
@@ -153,6 +282,40 @@ export function BrowserPanel(props: {
 		} else if (defaultUARef.current) {
 			wv.setUserAgent(defaultUARef.current);
 		}
+	}, []);
+
+	/** 注入错误捕获脚本（常驻）+ 启动轮询读取 guest 的错误日志（替代不可靠的 console-message） */
+	const startErrorCapture = useCallback(() => {
+		const wv = webviewRef.current;
+		if (!wv) return;
+		wv.executeJavaScript(ERROR_CAPTURE_SCRIPT).catch(() => {
+			/* ignore */
+		});
+		if (errorPollTimerRef.current) return; // 轮询已运行，幂等
+		const poll = async () => {
+			const cur = webviewRef.current;
+			if (!cur) return;
+			try {
+				const res = await cur.executeJavaScript(
+					"window.__pideckErrors && window.__pideckErrors.length ? JSON.stringify(window.__pideckErrors) : null",
+				);
+				if (res) {
+					const remote = JSON.parse(res);
+					setConsoleErrors((prev) => {
+						const seen = new Set(prev.map((e) => e.id));
+						const merged = [...prev];
+						for (const e of remote) {
+							if (!seen.has(e.id)) merged.push(e);
+						}
+						return merged.slice(-50);
+					});
+				}
+			} catch {
+				/* webview 未就绪/已卸载时忽略 */
+			}
+			errorPollTimerRef.current = setTimeout(() => void poll(), 1500);
+		};
+		void poll();
 	}, []);
 
 	const updateActiveTab = useCallback(
@@ -194,6 +357,8 @@ export function BrowserPanel(props: {
 
 		const onDomReady = () => {
 			webviewReadyRef.current = true;
+			// 注入错误捕获脚本（常驻）+ 启动轮询
+			startErrorCapture();
 		};
 		wv.addEventListener("dom-ready", onDomReady);
 
@@ -204,6 +369,8 @@ export function BrowserPanel(props: {
 			setCanGoBack(wv.canGoBack());
 			setCanGoForward(wv.canGoForward());
 			updateActiveTab({ url: nextUrl });
+			// 跨文档导航后 guest 重建，重新注入错误捕获
+			startErrorCapture();
 		};
 		const onDidNavigateInPage = (event: Event) => {
 			const evt = event as unknown as WebviewEvent<"did-navigate-in-page">;
@@ -263,7 +430,7 @@ export function BrowserPanel(props: {
 			wv.removeEventListener("new-window", onNewWindow);
 			webviewReadyRef.current = false;
 		};
-	}, [applyDeviceUserAgent, updateActiveTab, url]);
+	}, [applyDeviceUserAgent, startErrorCapture, updateActiveTab, url]);
 
 	// 不再在卸载时清空 moduleState：折叠抽屉、切换面板后重新打开仍保留之前的 tab 状态。
 	// 关闭最后一个 tab 时 closeTab 已处理 moduleState 清理并调用 onClose。
@@ -374,6 +541,80 @@ export function BrowserPanel(props: {
 		return () => document.removeEventListener("mousedown", handleMouseDown);
 	}, [deviceMenuOpen]);
 
+	const stopLightSelectPoll = useCallback(() => {
+		if (lightSelectTimerRef.current) {
+			clearTimeout(lightSelectTimerRef.current);
+			lightSelectTimerRef.current = null;
+		}
+		setLightSelectActive(false);
+	}, []);
+
+	/** 清空 guest 页面已收集的错误（配合面板「清空」按钮） */
+	const clearGuestErrors = useCallback(() => {
+		const wv = webviewRef.current;
+		if (!wv) return;
+		wv.executeJavaScript("window.__pideckErrors = []; true").catch(() => {
+			/* ignore */
+		});
+	}, []);
+
+
+	/** 轮询读取 guest 页面的选中结果（console-message 在 contextIsolation 下不可靠，改用 executeJavaScript） */
+	const pollLightSelect = useCallback(async () => {
+		const wv = webviewRef.current;
+		if (!wv) return;
+		try {
+			const res = await wv.executeJavaScript(
+				`window.__lightSelectResult ? (() => { const r = window.__lightSelectResult; window.__lightSelectResult = null; return JSON.stringify(r); })() : null`,
+			);
+			if (res) {
+				const info = JSON.parse(res);
+				setLightSelectActive(false);
+				// 独立窗口（floating 渲染进程）：经 IPC 转发主窗口填入聊天输入框；
+				// 侧边栏（同渲染进程）：直接派发全局事件。
+				const isFloatingWindow =
+					new URLSearchParams(window.location.search).get("floating") === "browser";
+				if (isFloatingWindow) {
+					void window.piDesktop?.browser?.sendLightSelect?.(info);
+				} else {
+					window.dispatchEvent(new CustomEvent("pideck:light-select", { detail: info }));
+				}
+				return;
+			}
+		} catch {
+			// 页面导航/执行异常时静默停止
+			setLightSelectActive(false);
+			return;
+		}
+		lightSelectTimerRef.current = setTimeout(() => {
+			void pollLightSelect();
+		}, 200);
+	}, []);
+
+	const handleLightSelect = useCallback(async () => {
+		const wv = webviewRef.current;
+		if (!wv) return;
+		if (lightSelectActive) {
+			// 已激活 → 取消选择模式
+			try {
+				await wv.executeJavaScript(
+					"window.__lightSelectStop && window.__lightSelectStop(); window.__lightSelectResult = null; true",
+				);
+			} catch {
+				/* ignore */
+			}
+			stopLightSelectPoll();
+			return;
+		}
+		try {
+			await wv.executeJavaScript(LIGHT_SELECT_SCRIPT);
+			setLightSelectActive(true);
+			void pollLightSelect();
+		} catch {
+			// webview 未就绪时静默失败
+		}
+	}, [lightSelectActive, pollLightSelect, stopLightSelectPoll]);
+
 	const handleKeyDown = useCallback(
 		(event: React.KeyboardEvent) => {
 			if (event.key !== "Enter") return;
@@ -382,6 +623,26 @@ export function BrowserPanel(props: {
 		},
 		[navigate],
 	);
+
+	// 获取 webview guest preload 路径（file:// URL）
+	useEffect(() => {
+		void window.piDesktop?.browser?.getGuestPreloadPath?.().then((p) => {
+			if (p) setGuestPreload(p);
+		});
+	}, []);
+
+	// 组件卸载时清理轮询定时器
+	useEffect(() => {
+		return () => {
+			if (lightSelectTimerRef.current) {
+				clearTimeout(lightSelectTimerRef.current);
+			}
+			if (errorPollTimerRef.current) {
+				clearTimeout(errorPollTimerRef.current);
+			}
+		};
+	}, []);
+
 
 	const panelClass = `browser-panel${props.isFullscreen ? " is-fullscreen" : ""} device-${device}`;
 	const activeDevicePreset = DEVICE_PRESETS.find((preset) => preset.id === device) ?? DEVICE_PRESETS[0];
@@ -470,6 +731,38 @@ export function BrowserPanel(props: {
 						</div>
 					)}
 				</div>
+				<button
+					type="button"
+					className="browser-nav-btn"
+					onClick={() => {
+						const target = url || inputValue || DEFAULT_HOME;
+						// 弹出独立窗口后卸载侧边栏 webview，避免双份页面同时加载
+						setSuspended(true);
+						void window.piDesktop?.browser?.openWindow?.(target);
+					}}
+					title={t("browser.openWindow")}
+				>
+					<ExternalLink size={15} />
+				</button>
+				<button
+					type="button"
+					className={`browser-nav-btn${lightSelectActive ? " active" : ""}`}
+					onClick={() => void handleLightSelect()}
+					title={t("browser.lightSelect")}
+				>
+					<MousePointerClick size={15} />
+				</button>
+				<button
+					type="button"
+					className={`browser-console-trigger${consoleErrors.length > 0 ? " has-errors" : ""}${consolePanelOpen ? " active" : ""}`}
+					onClick={() => setConsolePanelOpen((open) => !open)}
+					title={t("browser.consoleErrors")}
+				>
+					<TriangleAlert size={14} />
+					{consoleErrors.length > 0 && (
+						<span className="browser-console-count">{consoleErrors.length > 99 ? "99+" : consoleErrors.length}</span>
+					)}
+				</button>
 				{props.isFullscreen ? (
 					<>
 						<button className="browser-nav-btn" onClick={onMinimize} title={t("browser.minimize")}>
@@ -488,9 +781,81 @@ export function BrowserPanel(props: {
 				</div>
 			)}
 
+			{consolePanelOpen && (
+				<div className="browser-console-panel">
+					<div className="browser-console-header">
+						<span>
+							{t("browser.consoleErrors")}（{consoleErrors.length}）
+						</span>
+						<div className="browser-console-actions">
+							<button type="button" onClick={() => { setConsoleErrors([]); void clearGuestErrors(); }}>
+								{t("browser.consoleClear")}
+							</button>
+							<button type="button" onClick={() => setConsolePanelOpen(false)}>
+								{t("browser.consoleClose")}
+							</button>
+						</div>
+					</div>
+					<div className="browser-console-list">
+						{consoleErrors.length === 0 ? (
+							<div className="browser-console-empty">{t("browser.consoleEmpty")}</div>
+						) : (
+							consoleErrors.map((err) => (
+								<div key={err.id} className={`browser-console-item level-${err.level}`}>
+									<div className="browser-console-time">{err.time}</div>
+									<div className="browser-console-msg">{err.message}</div>
+									{err.sourceId && (
+										<div className="browser-console-src">
+											{err.sourceId}
+											{err.line ? `:${err.line}` : ""}
+										</div>
+									)}
+								</div>
+							))
+						)}
+					</div>
+				</div>
+			)}
+
 			<div className="browser-webview-stage">
-				<webview ref={(el) => { (webviewRef as React.MutableRefObject<any>).current = el; if (el) el.setAttribute("allowfileaccess", "true"); }} className="browser-webview" src={initialTab.url} allowpopups={"true" as any} />
+				{suspended ? (
+					<div className="browser-suspended-hint">{t("browser.suspendedHint")}</div>
+				) : (
+					<webview
+						ref={(el) => {
+							(webviewRef as React.MutableRefObject<any>).current = el;
+							if (el) el.setAttribute("allowfileaccess", "true");
+						}}
+						className="browser-webview"
+						preload={guestPreload || undefined}
+						src={guestPreload ? initialTab.url : undefined}
+						allowpopups={"true" as any}
+					/>
+				)}
 			</div>
+		</div>
+	);
+}
+
+/**
+ * 独立浏览器窗口模式（主进程以 ?floating=browser 加载本入口）。
+ * 只渲染全宽浏览器面板，不渲染 PiDeck 主 UI；窗口关闭 = 关闭面板。
+ */
+export function FloatingBrowserWindow() {
+	const initialUrl = new URLSearchParams(window.location.search).get("url") ?? "";
+	useEffect(() => {
+		if (initialUrl && /^https?:\/\//i.test(initialUrl)) {
+			navigateTo(initialUrl);
+		}
+	}, [initialUrl]);
+	return (
+		<div style={{ height: "100vh", display: "flex", flexDirection: "column" }}>
+			<BrowserPanel
+				isFullscreen
+				hideChromeClose
+				onClose={() => window.close()}
+				onMinimize={() => window.close()}
+			/>
 		</div>
 	);
 }

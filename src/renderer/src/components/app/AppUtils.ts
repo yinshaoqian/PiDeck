@@ -312,12 +312,26 @@ export function groupToolMessages(messages: ChatMessage[]): RenderMessage[] {
 			currentThinking.push(message);
 			runEndedAt = message.timestamp;
 		} else if (message.role === "assistant") {
-			// 有暂存 run 时先合并到当前 run
-			if (pendingRun) {
-				currentRun.push(...pendingRun);
-				pendingRun = null;
+			// thinking + text 同消息（如“思考完直接回答”）：thinking 必须聚合进
+			// thinking-group，不能只当正文——否则最后一段思考在完成/恢复后消失。
+			// 正文非空时走 appendRunMessage（内部先 flushThinking，thinking-group 在正文前）。
+			const hasThinking = Boolean(message.thinking?.trim());
+			if (hasThinking) {
+				if (currentRun.length === 0 && currentThinking.length === 0) {
+					runStartedAt = message.timestamp;
+				}
+				currentThinking.push(message);
+				runEndedAt = message.timestamp;
 			}
-			appendRunMessage(message);
+			const bodyText = stripThinkingTags(stripAnsi(message.text)).trim();
+			if (bodyText) {
+				// 有暂存 run 时先合并到当前 run
+				if (pendingRun) {
+					currentRun.push(...pendingRun);
+					pendingRun = null;
+				}
+				appendRunMessage(message);
+			}
 		} else if (message.role === "tool") {
 			flushThinking();
 			if (currentRun.length === 0) runStartedAt = message.timestamp;

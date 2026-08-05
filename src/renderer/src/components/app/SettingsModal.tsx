@@ -778,6 +778,35 @@ function SettingsModalContent(props: SettingsModalProps) {
 											{t("settings.maxEditorFileSizeDesc")}
 										</small>
 									</div>
+									<SettingSwitch
+										title={t("settings.memoryInjection")}
+										description={t("settings.memoryInjectionDesc")}
+										checked={draftSettings.memoryInjectionEnabled}
+										onChange={(checked) =>
+											updateDraft({ memoryInjectionEnabled: checked })
+										}
+									/>
+									{draftSettings.memoryInjectionEnabled && (
+										<div className="setting-field">
+											<span>
+												{t("settings.memoryInjectionTopK")}
+												<DirtyMarker dirty={isDirty("memoryInjectionTopK")} label={t("settings.memoryInjectionTopK")} />
+											</span>
+											<input
+												type="number"
+												min={1}
+												max={8}
+												value={String(draftSettings.memoryInjectionTopK)}
+												onChange={(e) => {
+													const k = Math.max(1, Math.min(8, parseInt(e.target.value) || 3));
+													updateDraft({ memoryInjectionTopK: k });
+												}}
+											/>
+											<small style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
+												{t("settings.memoryInjectionTopKDesc")}
+											</small>
+										</div>
+									)}
 								</SettingsSection>
 								<SettingsSection title={t("settings.git")}>
 									<SettingSwitch
@@ -1297,6 +1326,29 @@ function SettingsModalContent(props: SettingsModalProps) {
 											{t("settings.toggle")}
 										</Button>
 									</div>
+								</SettingsSection>
+								<SettingsSection title={t("settings.domAgent")}>
+									<div className="setting-field">
+										<span>
+											{t("settings.domAgentPath")}
+											<DirtyMarker dirty={isDirty("domAgentExtensionPath")} label={t("settings.domAgentPath")} />
+										</span>
+										<input
+											type="text"
+											value={draftSettings.domAgentExtensionPath}
+											placeholder="C:/kaifa/dom-agent-extension/extension"
+											onChange={(e) => updateDraft({ domAgentExtensionPath: e.target.value })}
+										/>
+										<small style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
+											{t("settings.domAgentPathDesc")}
+										</small>
+									</div>
+									<SettingSwitch
+										title={t("settings.domAgentBar")}
+										description={t("settings.domAgentBarDesc")}
+										checked={draftSettings.domAgentBarVisible}
+										onChange={(checked) => updateDraft({ domAgentBarVisible: checked })}
+									/>
 								</SettingsSection>
 								<SettingsSection title={t("settings.webLocalService")} description={t("settings.webLocalServiceDesc")}>
 									<SettingSwitch

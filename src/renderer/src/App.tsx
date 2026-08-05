@@ -152,6 +152,7 @@ import {
   MERGED_TASK_WIDGET_KEY,
   PLAN_WIDGET_KEY,
   TODO_WIDGET_KEY,
+  TASK_ANCHOR_WIDGET_KEY,
   MultiSelectModal,
   WorktreeCreateDialog,
   stripMarkdown,
@@ -159,7 +160,9 @@ import {
   type SessionModifiedFile,
 } from "./components/app/AppParts";
 import { GitPanel } from "./components/app/GitPanel";
-import { BrowserPanel, moduleState, navigateTo } from "./components/app/BrowserPanel";
+import { MemoryPanel } from "./components/app/MemoryPanel";
+import { AppErrorBoundary } from "./components/ui/AppErrorBoundary";
+import { BrowserPanel, FloatingBrowserWindow, moduleState, navigateTo } from "./components/app/BrowserPanel";
 import {
   groupToolMessages,
   getMultiSelectImageCaptureIds,
@@ -204,6 +207,8 @@ import type {
   AgentTab,
   AppInfo,
   AppSettings,
+  TaskAnchorItem,
+  TaskAnchorStatus,
   AppUpdateDownloadProgress,
   AppUpdateInfo,
   AvailableModel,
@@ -311,6 +316,36 @@ function formatCodexSubagentName(session: SessionSummary) {
 /** pi 原生子会话名称：优先使用会话名，回退到 "子会话" */
 function formatPiSubagentName(session: SessionSummary) {
   return session.name || t("app.piSubagent");
+}
+
+/** 侧栏子会话状态徽标：running/completed/attention/failed → 文案 + 语义色（样式复用 .subagent-status-badge） */
+function renderSubagentStatusBadge(session: SessionSummary) {
+  if (!session.subagentStatus) return null;
+  const label =
+    session.subagentStatus === "running"
+      ? t("drawer.subagentStatusRunning")
+      : session.subagentStatus === "completed"
+        ? t("drawer.subagentStatusCompleted")
+        : session.subagentStatus === "attention"
+          ? t("drawer.subagentStatusAttention")
+          : t("drawer.subagentStatusFailed");
+  return <span className={`subagent-status-badge ${session.subagentStatus}`}>{label}</span>;
+}
+
+/**
+ * 只读子会话消息指纹：条数 + 内容总长度 + 尾部消息状态。
+ * 轮询刷新时用它判断会话文件是否真的变化，避免无变化时反复重渲染导致闪烁。
+ */
+function readonlyMessagesSignature(msgs: ChatMessage[]): string {
+  let len = 0;
+  let tail = "";
+  const n = msgs.length;
+  for (let i = Math.max(0, n - 3); i < n; i++) {
+    const m = msgs[i];
+    len += String(m.text ?? "").length;
+    tail += `|${m.id}:${m.role}:${String(m.meta?.status ?? "")}`;
+  }
+  return `${n}:${len}${tail}`;
 }
 
 function isAbsoluteFilePath(path: string) {
@@ -550,7 +585,11 @@ class PromptDeliveryUnknownError extends Error {
 }
 
 export function App() {
-  if (missingElectronPreload) {
+	// 独立浏览器窗口模式（主进程以 ?floating=browser 加载）：只渲染全宽浏览器面板，不加载主 UI
+	if (new URLSearchParams(window.location.search).get("floating") === "browser") {
+		return <FloatingBrowserWindow />;
+	}
+	if (missingElectronPreload) {
     return (
       <div className="boot-screen root-loading">
         {/* 与 EmptyState / index.html 启动标同一 path，避免 LogoMark 再套一层不同底色 */}
@@ -613,6 +652,32 @@ export function App() {
   const [messagesByAgent, setMessagesByAgent] = useState<
     Record<string, ChatMessage[]>
   >({});
+  /** 只读查看中的子会话（点击子 Agent 时仅看聊天记录，不自动恢复；点“恢复会话”才真正拉起） */
+  const [readonlyViewer, setReadonlyViewer] = useState<{
+    projectId: string;
+    sessionPath: string;
+    title?: string;
+  } | null>(null);
+  /** 只读查看的会话消息（readSessionDisplayMessages 直接读文件构造，毫秒级） */
+  const [readonlyMessages, setReadonlyMessages] = useState<ChatMessage[]>([]);
+  /** 任务锚（Task Anchor）：全局任务列表（三态 doing/review/done），持久化 + Agent 联动 */
+  const [taskAnchors, setTaskAnchors] = useState<TaskAnchorItem[]>([]);
+  const [editingTaskAnchor, setEditingTaskAnchor] = useState(false);
+  const [taskAnchorDraft, setTaskAnchorDraft] = useState("");
+  /** 任务锚：从主进程加载 + 订阅变化（Agent 扩展写文件后实时刷新） */
+  const persistTaskAnchors = useCallback((tasks: TaskAnchorItem[]) => {
+    setTaskAnchors(tasks);
+    // ?. 防御：preload 未更新（旧版本无 taskAnchor API）时不崩，任务锚仅本地生效
+    void api.taskAnchor?.save(tasks).catch(() => undefined);
+  }, []);
+  useEffect(() => {
+    void api.taskAnchor?.load().then(setTaskAnchors).catch(() => undefined);
+    const off = api.taskAnchor?.onChanged(() => {
+      void api.taskAnchor?.load().then(setTaskAnchors).catch(() => undefined);
+    });
+    return off;
+  }, []);
+
   const [files, setFiles] = useState<FileTreeNode[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [sessionsByProject, setSessionsByProject] = useState<
@@ -1242,7 +1307,7 @@ export function App() {
   /** 打开文件编辑器前所在的抽屉面板（兼容旧路径）；新路径编辑器固定挂在 files Tab */
   const prevDrawerPanelRef = useRef<DrawerPanel | null>(null);
   /** 最近一次右侧工具 Tab（文件/Git/浏览器），供标题栏一键展开恢复 */
-  const lastToolDrawerRef = useRef<"files" | "git" | "browser">("files");
+  const lastToolDrawerRef = useRef<"files" | "git" | "browser" | "memory">("files");
   // 兼容旧路径：drawer=editor 统一落到 files Tab（编辑器作为 files 子视图）
   useEffect(() => {
     if (drawer === "editor") {
@@ -1314,6 +1379,8 @@ export function App() {
     desktopProxyUrl: "http://127.0.0.1:7890",
     desktopProxyBypass: "localhost,127.0.0.1,::1",
     customPiPath: "",
+    memoryInjectionEnabled: true,
+    memoryInjectionTopK: 3,
     wslEnabled: false,
     wslDistro: "Ubuntu",
     wslUser: "root",
@@ -1322,6 +1389,8 @@ export function App() {
     webServiceHost: "0.0.0.0",
     webServicePort: 8765,
     rpcTimeout: 600_000,
+    domAgentExtensionPath: "C:/kaifa/dom-agent-extension/extension",
+    domAgentBarVisible: true,
     linkOpenMode: "external",
     contentMaxWidth: 1400,
     maxEditorFileSizeMB: 5,
@@ -1606,6 +1675,40 @@ export function App() {
     });
   }
 
+  // 浏览器侧边栏/独立窗口「选择元素」→ 把选中 DOM 信息填入聊天输入框
+  // 侧边栏走同进程 CustomEvent；独立窗口经 IPC 转发到主窗口（onLightSelect）
+  useEffect(() => {
+    const handleLightSelect = (raw: unknown) => {
+      const info = raw as { selector?: string; tag?: string; text?: string; html?: string } | undefined;
+      if (!info?.selector) return;
+      const lines = [
+        "帮我看看浏览器里选中的这个元素：",
+        `- 标签: ${info.tag ?? ""}`,
+        `- 选择器: ${info.selector}`,
+      ];
+      if (info.text) lines.push(`- 文本: ${info.text}`);
+      const text = lines.join("\n");
+      const agentId = activeAgentIdRef.current;
+      if (agentId) {
+        setPromptForAgent(agentId, text);
+        showNotice("已填入选中元素信息", 2500);
+      } else {
+        // 无活跃会话：信息不丢——复制到剪贴板并明确提示，避免“点击没效果”的错觉
+        void navigator.clipboard.writeText(text).catch(() => {});
+        showNotice("已复制选中元素信息（当前无活跃会话，请先打开会话）", 4000);
+      }
+    };
+    const onCustomEvent = (event: Event) =>
+      handleLightSelect((event as CustomEvent).detail);
+    window.addEventListener("pideck:light-select", onCustomEvent);
+    const offIpc = window.piDesktop?.browser?.onLightSelect?.(handleLightSelect);
+    return () => {
+      window.removeEventListener("pideck:light-select", onCustomEvent);
+      offIpc?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   /** 同步 hasComposerText / composerBangMode 等布尔状态，仅在值翻转时触发重渲染。 */
   function syncComposerFlags(text: string) {
     const hasContent = text.trim().length > 0;
@@ -1630,8 +1733,7 @@ export function App() {
     // 仅 chips 变化时才更新 promptByAgent（触发 RichInput 的 useMemo chips 重算 + renderDom）。
     // 但文本从有到无/从无到有时也要更新，否则 prompt 兜底读旧值导致 placeholder 不显示。
     const oldValue = promptByAgent[agentId] ?? "";
-    const oldChipsKey = parseRichInputChips(oldValue, validCommandNames, validFilePaths, validSessionRefs)
-      .map((c) => `${c.start}:${c.end}:${c.kind}`)
+    const oldChipsKey = parseRichInputChips(oldValue, validCommandNames, validFilePaths, validSessionRefs)      .map((c) => `${c.start}:${c.end}:${c.kind}`)
       .join(",");
     const newChipsKey = parseRichInputChips(value, validCommandNames, validFilePaths, validSessionRefs)
       .map((c) => `${c.start}:${c.end}:${c.kind}`)
@@ -1731,6 +1833,51 @@ export function App() {
   const activeMessages = activeAgentId
     ? (messagesByAgent[activeAgentId] ?? [])
     : [];
+  /** 只读子会话查看的消息（同样走分页/分组管线，复用 TurnRow 渲染） */
+  const {
+    visibleMessages: readonlyPaginatedMessages,
+    hasMore: readonlyHasMore,
+    loadMore: loadMoreReadonlyMessages,
+    isLoading: readonlyLoadingMore,
+  } = useMessagePagination({
+    messages: readonlyMessages,
+    initialPageSize: 50,
+    pageSize: 50,
+    enabled: readonlyMessages.length > 50,
+  });
+  const readonlyRuns = useMemo(
+    () => groupToolMessages(readonlyPaginatedMessages),
+    [readonlyPaginatedMessages],
+  );
+
+  // 只读子会话动态刷新：子 agent 在后台运行时会话 JSONL 持续写入，但 openReadonlySession
+  // 只加载过一次快照。此处轮询读文件，仅当内容签名变化时更新 state，避免无变化时反复重渲染。
+  useEffect(() => {
+    const viewer = readonlyViewer;
+    if (!viewer) return;
+    let cancelled = false;
+    let lastSig = "";
+    const readAndUpdate = async () => {
+      try {
+        const msgs = await api.sessions.readChatMessages(viewer.sessionPath);
+        if (cancelled || !msgs) return;
+        const sig = readonlyMessagesSignature(msgs);
+        if (sig !== lastSig) {
+          lastSig = sig;
+          setReadonlyMessages(msgs);
+        }
+      } catch {
+        /* 会话文件读取失败静默 */
+      }
+    };
+    // 打开即刷一次（覆盖加载瞬间的新消息），随后 2s 轮询
+    void readAndUpdate();
+    const timer = setInterval(() => void readAndUpdate(), 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [readonlyViewer?.sessionPath]);
   const agentRuntimeState = activeAgentId
     ? runtimeStateByAgent[activeAgentId]
     : undefined;
@@ -2763,7 +2910,9 @@ export function App() {
     }
 
     // 子会话由扩展直接写盘，运行期间保留低频兜底；工具 start/end 不应重置计时器并触发额外扫描。
-    const timer = window.setInterval(scheduleRefresh, 15_000);
+    // 15s→3s：配合 SessionScanner 分区预过滤（单项目扫描已从秒级降到毫秒级），
+    // 让并行子 Agent 完成后 3 秒内出现在左侧列表，不再等 8 个全做完才可见。
+    const timer = window.setInterval(scheduleRefresh, 3_000);
     return () => {
       disposed = true;
       window.clearInterval(timer);
@@ -2958,15 +3107,22 @@ export function App() {
       }));
   }, [activeProjectId, activeAgentId]);
 
+  // 命令列表拉取：冷启动时 pi 进程初始化（扩展 jiti 编译等）可达数十秒，期间不读 stdin；
+  // 若在 starting 阶段调 get_commands，30s RPC 超时后返回空列表且不再重试，导致 "/" 菜单缺扩展命令
+  // （如 /dom-selections）与 prompt 模板（如 /dom）。修复：starting 阶段跳过拉取，
+  // 待 agent 状态变为 idle/running（进程已就绪）后再拉取并覆盖。
+  const activeAgentStatus = activeAgent?.status;
   useEffect(() => {
-    if (activeAgentId && !isPendingAgentId(activeAgentId))
-      void api.agents
-        .commands(activeAgentId)
-        // goal 模式这版先不公开入口；保留底层实现,等待官方 plan/goal 能力稳定后再决定是否恢复。
-        .then((cmds) => setCommands(cmds))
-        .catch(() => setCommands([]));
-    else setCommands([]);
-  }, [activeAgentId]);
+    if (!activeAgentId || isPendingAgentId(activeAgentId)) {
+      setCommands([]);
+      return;
+    }
+    if (activeAgentStatus === "starting") return; // 进程初始化中，等待 idle 后重拉
+    void api.agents
+      .commands(activeAgentId)
+      .then((cmds) => setCommands(cmds))
+      .catch(() => setCommands([]));
+  }, [activeAgentId, activeAgentStatus]);
 
   useEffect(() => {
     // 默认选中第一项（目录树根级目录），便于浏览项目结构
@@ -3895,14 +4051,52 @@ export function App() {
       session.filePath,
     );
     if (existingAgent) {
-      // 已启动的子会话仍复用父会话下的原行；点击它应直接切回 Agent，不能再退回 Viewer 后重复走启动交接。
+      // 已启动的会话（含已恢复的子会话）点击直接切回 Agent，不再退回只读查看。
       setActiveProjectId(projectId);
       setActiveAgentId(existingAgent.id);
       setAutoScroll(true);
       autoScrollRef.current = true;
       return;
     }
+    // 子会话（parentSessionPath 有值且未恢复）：只读查看聊天记录，不自动恢复 agent；
+    // 用户点输入区“恢复会话”按钮后才真正拉起（子 Agent 是 pi-subagents 内部会话，
+    // 多数场景只需看记录，无需恢复成可对话的独立 Agent）。
+    if (session.parentSessionPath) {
+      await openReadonlySession(projectId, session);
+      return;
+    }
     return createAgent(projectId, session.filePath, session.name);
+  }
+
+  /**
+   * 只读查看子会话：直接读 JSONL 构造时间线（毫秒级），不 spawn pi 进程。
+   * 输入区显示「恢复会话」按钮，由用户主动决定是否恢复。
+   */
+  async function openReadonlySession(
+    projectId: string,
+    session: SessionSummary,
+  ) {
+    // 退出只读态时不残留旧会话消息，避免切换时闪出上一条会话内容
+    setReadonlyMessages([]);
+    setReadonlyViewer({ projectId, sessionPath: session.filePath, title: session.name });
+    setActiveProjectId(projectId);
+    // 清理当前激活的 agent 选择（只读查看不占用 agent 槽位）
+    setActiveAgentId((current) => (current ? undefined : current));
+    try {
+      const msgs = await api.sessions.readChatMessages(session.filePath);
+      setReadonlyMessages(msgs ?? []);
+    } catch {
+      setReadonlyMessages([]);
+    }
+  }
+
+  /** 用户点击「恢复会话」：退出只读态，走正常的 agent 激活流程 */
+  async function restoreReadonlySession() {
+    const viewer = readonlyViewer;
+    if (!viewer) return;
+    setReadonlyViewer(null);
+    setReadonlyMessages([]);
+    await createAgent(viewer.projectId, viewer.sessionPath, viewer.title);
   }
 
   async function copySidebarSession(
@@ -4329,6 +4523,9 @@ export function App() {
     if (!projectId) return;
     const project = projects.find((item) => item.id === projectId);
     if (!project) return;
+    // 进入真实 agent 激活时退出只读子会话查看态
+    setReadonlyViewer(null);
+    setReadonlyMessages([]);
     const existing = sessionPath
       ? [...displayAgents, ...pendingAgentsRef.current].find(
           (agent) =>
@@ -4378,6 +4575,21 @@ export function App() {
       });
     }
     // 创建 agent 时不改变抽屉状态，避免打断用户已有的文件浏览。
+    // 历史/子会话点击：立即从 JSONL 文件构造时间线秒开（Viewer 能力），
+    // 不等 pi 进程就绪（spawn+扩展加载要 1.7~40s，而读文件只需几毫秒）。
+    // 消息先挂到 pendingTab.id，agent 就绪后由 onMessages 以权威数据覆盖。
+    if (sessionPath) {
+      void api.sessions.readChatMessages(sessionPath)
+        .then((msgs) => {
+          if (msgs.length > 0) {
+            setMessagesByAgent((current) => ({
+              ...current,
+              [pendingTab.id]: msgs,
+            }));
+          }
+        })
+        .catch(() => undefined); // 读文件失败不影响 createAgent 正常流程
+    }
     try {
       const tab = await withTimeout<AgentTab>(
         api.agents.create({ projectId, sessionPath, title, noSession }),
@@ -4400,6 +4612,14 @@ export function App() {
         (agent) => agent.id !== pendingTab.id,
       );
       setPendingAgents(pendingAgentsRef.current);
+      // viewer 秒开的消息从 pendingTab 迁移到真实 tab：
+      // activeAgentId 即将切到 tab.id，若此时主进程历史加载尚未完成，
+      // 不迁移会导致聊天记录闪空；真实消息到达后 onMessages 会覆盖。
+      setMessagesByAgent((current) => {
+        const viewerMsgs = current[pendingTab.id];
+        if (!viewerMsgs?.length) return current;
+        return { ...current, [tab.id]: viewerMsgs };
+      });
       setActiveAgentId((current) =>
         current === pendingTab.id ? tab.id : current,
       );
@@ -6203,9 +6423,9 @@ export function App() {
     });
   }
 
-  /** 右侧工具栏 Tab 面板（文件/Git/浏览器），与 editor/sessions 区分 */
-  function isToolDrawerPanel(panel: DrawerPanel | null | undefined): panel is "files" | "git" | "browser" {
-    return panel === "files" || panel === "git" || panel === "browser";
+  /** 右侧工具栏 Tab 面板（文件/Git/浏览器/记忆），与 editor/sessions 区分 */
+  function isToolDrawerPanel(panel: DrawerPanel | null | undefined): panel is "files" | "git" | "browser" | "memory" {
+    return panel === "files" || panel === "git" || panel === "browser" || panel === "memory";
   }
 
   function openDrawer(panel: DrawerPanel) {
@@ -6232,7 +6452,7 @@ export function App() {
   }
 
   /** 切换右侧工具 Tab：始终打开目标面板，不走 openDrawer 的“再点一次关闭”逻辑 */
-  function switchToolDrawer(panel: "files" | "git" | "browser") {
+  function switchToolDrawer(panel: "files" | "git" | "browser" | "memory") {
     if (panel === "git" && !settings.enableGitManagement) return;
     if (drawerPinned && drawerPinnedPanel && drawerPinnedPanel !== panel) return;
     if (panel !== "git") setGitDrawerDiff(null);
@@ -6833,6 +7053,7 @@ export function App() {
                     const renderSubagentRow = (
                       subagent: SessionSummary,
                       label: ReactNode,
+                      statusBadge?: ReactNode,
                     ) => {
                       const subagentAgent = getAgentForSessionPath(
                         allProjectAgents,
@@ -6876,7 +7097,7 @@ export function App() {
                           }}
                         >
                           <div className="conversation-body">
-                            <div className="conversation-title">{label}</div>
+                            <div className="conversation-title">{label}{statusBadge}</div>
                           </div>
                         </button>
                       );
@@ -6904,6 +7125,7 @@ export function App() {
                           {subagents.map((subagent) => renderSubagentRow(
                             subagent,
                             <strong>{formatPiSubagentName(subagent)}</strong>,
+                            renderSubagentStatusBadge(subagent),
                           ))}
                         </div>
                       );
@@ -7249,7 +7471,7 @@ export function App() {
                                   <div className="codex-subagent-sidebar-group">
                                     {item.piSubagents.map((sa) => (
                                       <button key={sa.filePath} className={`conversation agent-row session-row codex-subagent-sidebar-row${isSameSessionPath(sa.filePath, displayedSidebarSessionPath) ? " active" : ""}`} title={sa.filePath} onClick={() => void openSidebarSession(childProject!.id, sa)}>
-                                        <div className="conversation-body"><div className="conversation-title"><strong>{formatPiSubagentName(sa)}</strong></div></div>
+                                        <div className="conversation-body"><div className="conversation-title"><strong>{formatPiSubagentName(sa)}</strong>{renderSubagentStatusBadge(sa)}</div></div>
                                       </button>
                                     ))}
                                   </div>
@@ -7295,7 +7517,7 @@ export function App() {
                                   <div className="codex-subagent-sidebar-group">
                                     {item.piSubagents.map((sa) => (
                                       <button key={sa.filePath} className={`conversation agent-row session-row codex-subagent-sidebar-row${isSameSessionPath(sa.filePath, displayedSidebarSessionPath) ? " active" : ""}`} title={sa.filePath} onClick={() => void openSidebarSession(childProject!.id, sa)}>
-                                        <div className="conversation-body"><div className="conversation-title"><strong>{formatPiSubagentName(sa)}</strong></div></div>
+                                        <div className="conversation-body"><div className="conversation-title"><strong>{formatPiSubagentName(sa)}</strong>{renderSubagentStatusBadge(sa)}</div></div>
                                       </button>
                                     ))}
                                   </div>
@@ -7600,7 +7822,96 @@ export function App() {
           {/* Agent 启动时显示骨架屏；消息尚未到达时继续展示，避免闪空
                Agent 状态已是 idle 时不再显示，即使消息还未到达，
                避免 "正在启动 Agent" 在启动完成后仍卡住。 */}
-          {(activeAgent?.status === "starting" || (activeAgent?.status !== "idle" && Boolean(activeAgent) && activeMessages.length === 0 && !isPendingAgentId(activeAgent!.id))) ? (
+          {/* 只读子会话查看：点击子 Agent 仅展示聊天记录（直接读文件，毫秒级），
+              不自动恢复 agent；输入区显示「恢复会话」按钮由用户主动触发。 */}
+          {readonlyViewer && !activeAgentId && (
+            readonlyMessages.length === 0 ? (
+              <div className="history-loading">
+                <div className="history-loading-placeholder"><div className="skeleton-bubble" /></div>
+              </div>
+            ) : (
+              <div className="message-list">
+                {readonlyRuns.map((item) => {
+                  if (item.kind === "agent-run") {
+                    return (
+                      <TurnRow
+                        key={item.id}
+                        run={item}
+                        onPreviewImage={setPreviewImage}
+                        showThinking={settings.showThinking}
+                        isStreaming={false}
+                        agentRunning={false}
+                        onOpenExternal={(url) => api.app.openExternal(url)}
+                        onOpenFile={openFilePath}
+                        onDiffFile={diffFilePath}
+                        onEditMessage={() => {}}
+                        onDeleteMessage={() => {}}
+                        onEnterMultiSelect={() => {}}
+                      />
+                    );
+                  }
+                  if (item.kind !== "message") return null;
+                  const message = item.message;
+                  if (message.role === "user") {
+                    return (
+                      <UserBubble
+                        key={message.id}
+                        message={message}
+                        onPreviewImage={setPreviewImage}
+                        onOpenFile={openFilePath}
+                        onEditMessage={() => {}}
+                        onDeleteMessage={() => {}}
+                        onResendMessage={() => {}}
+                        onForkMessage={() => {}}
+                        agentRunning={false}
+                        forking={false}
+                        validCommandNames={new Set<string>()}
+                        validFilePaths={new Set<string>()}
+                        onEnterMultiSelect={() => {}}
+                      />
+                    );
+                  }
+                  if (message.role === "error") {
+                    return <DiagnosticMessageCard key={message.id} message={message} />;
+                  }
+                  if (message.role === "system") {
+                    const meta = message.meta as any;
+                    if (meta?.type === "compaction") {
+                      return <CompactionCard key={message.id} message={message} />;
+                    }
+                    return <DiagnosticMessageCard key={message.id} message={message} />;
+                  }
+                  return null;
+                })}
+                {readonlyHasMore && (
+                  <div style={{ display: "flex", justifyContent: "center", padding: "8px 0" }}>
+                    <button
+                      onClick={loadMoreReadonlyMessages}
+                      style={{
+                        padding: "6px 16px",
+                        border: "1px solid var(--border-color)",
+                        borderRadius: "6px",
+                        background: "var(--bg-secondary)",
+                        color: "var(--text-primary)",
+                        fontSize: "13px",
+                        cursor: readonlyLoadingMore ? "not-allowed" : "pointer",
+                        opacity: readonlyLoadingMore ? 0.6 : 1,
+                      }}
+                    >
+                      {readonlyLoadingMore
+                        ? "加载中..."
+                        : `加载更多历史消息 (${readonlyMessages.length - readonlyPaginatedMessages.length} 条)`}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )
+          )}
+
+          {/* Agent 启动时显示骨架屏（仅当尚无任何消息，如全新会话）；
+              历史/子会话已通过 Viewer 秒开消息，此时直接渲染消息列表，
+              不再展示“正在启动 Agent”的空白骨架。 */}
+          {(activeAgent?.status === "starting" && activeMessages.length === 0) || (activeAgent?.status !== "idle" && Boolean(activeAgent) && activeMessages.length === 0 && !isPendingAgentId(activeAgent!.id)) ? (
             <div className="history-loading">
               <div className="history-loading-placeholder">
                 <div className="skeleton-bubble" />
@@ -7620,13 +7931,13 @@ export function App() {
               <span style={{ paddingTop: "16px", alignSelf: "center", fontSize: "var(--font-size-small)" }}>{t("app.agentStarting")}</span>
             </div>
           ) : null}
-          {!activeAgent && (
+          {!activeAgent && !readonlyViewer && (
             <EmptyState
               hasProject={Boolean(activeProjectId)}
               onCreate={() => createAgent()}
             />
           )}
-          {(activeAgent && activeAgent.status !== "starting" && activeMessages.length > 0) ? (
+          {(activeAgent && activeMessages.length > 0) ? (
             <div className="message-list">
               {/* 使用 groupToolMessages 渲染：user/error/system 独立条目，
                   assistant + tool 聚合为 agnet-run（TurnRow 自带操作栏） */}
@@ -7671,6 +7982,14 @@ export function App() {
                       onEditMessage={editMessage}
                       onDeleteMessage={deleteMessage}
                       onForkMessage={forkFromUserMessage}
+                      onResendMessage={(m) =>
+                        void sendPrompt({
+                          agentId: activeAgentId ?? "",
+                          message: m.text,
+                          images: m.images ?? [],
+                          agentMode: currentComposerAgentMode,
+                        })
+                      }
                       agentRunning={isAgentBusy}
                       forking={forkingMessageId === message.id}
                       validCommandNames={validCommandNames}
@@ -7806,8 +8125,148 @@ export function App() {
             </button>
           )}
 
-        {activeAgent && (
+        {(activeAgent || readonlyViewer) && (
         <footer ref={composerRef} className="composer">
+          {/* 任务锚：复用 ExtensionWidgetCard（Todo 同款），会话级隔离（本会话任务 + 全局任务）三态分组，持久化 + Agent 联动 */}
+          {activeAgentId && (() => {
+            const all = Array.isArray(taskAnchors) ? taskAnchors : [];
+            // 会话级隔离：当前 agent 的 sessionId 过滤。本会话任务 + 全局任务（无 sessionId）可见；
+            // 其他会话的任务互不可见，切换会话后各看各的。拿不到 sessionId 时显示全部（兼容旧版）。
+            const activeSid = activeAgent?.sessionId;
+            const anchorList = activeSid
+              ? all.filter((i) => !i.sessionId || i.sessionId === activeSid)
+              : // 会话未启动（sessionId 来自 pi get_state，Agent 启动后才返回）：
+              // 不显示任何绑定会话的任务，仅保留全局任务（用户手动添加且未绑定会话）。
+              // 否则会出现「Agent 没启动却加载一堆历史会话任务」的堆积观感。
+              all.filter((i) => !i.sessionId);
+            const isGlobal = (i: TaskAnchorItem) => !i.sessionId;
+            const doing = anchorList.filter((i) => i.status === "doing");
+            const review = anchorList.filter((i) => i.status === "review");
+            const done = anchorList.filter((i) => i.status === "done");
+            const activeCount = doing.length + review.length;
+            // 分组展示行：本会话/全局分节，进行中/未确认在前，已完成折叠成一行计数（参考 todo 卡）
+            const groupLines = (items: TaskAnchorItem[]): string[] => {
+              const local = items.filter((i) => !isGlobal(i));
+              const global = items.filter(isGlobal);
+              const lines: string[] = [];
+              if (local.length > 0) {
+                lines.push("── 本会话 ──");
+                for (const t of local) lines.push(`☐ ${t.text}`);
+              }
+              if (global.length > 0) {
+                lines.push("── 全局 ──");
+                for (const t of global) lines.push(`☐ ${t.text}`);
+              }
+              return lines;
+            };
+            const lines: string[] = [];
+            if (doing.length > 0) {
+              lines.push("── 进行中 ──");
+              lines.push(...groupLines(doing).slice(1)); // 去掉重复的“──”头
+            }
+            if (review.length > 0) {
+              lines.push("── 调研完成·未确认 ──");
+              lines.push(...groupLines(review).slice(1));
+            }
+            if (done.length > 0) {
+              lines.push(`── 已完成（${done.length}）──`);
+              lines.push(...groupLines(done).slice(1));
+            }
+            const cycleStatus = (t: TaskAnchorItem): TaskAnchorStatus =>
+              t.status === "doing" ? "review" : t.status === "review" ? "done" : "doing";
+            return (
+              <div className="task-anchor-wrap">
+                <ExtensionWidgetCard
+                  widgetKey={TASK_ANCHOR_WIDGET_KEY}
+                  lines={lines}
+                  meta={anchorList.length > 0 ? `${done.length}/${anchorList.length}` : undefined}
+                  sessionIdOrPath={activeAgentId}
+                  onClose={() => {
+                    setEditingTaskAnchor(false);
+                    // 只移除当前可见任务（本会话 + 全局），保留其他会话的任务
+                    const visibleIds = new Set(anchorList.map((i) => i.id));
+                    persistTaskAnchors(taskAnchors.filter((i) => !visibleIds.has(i.id)));
+                  }}
+                />
+                {/* 添加/编辑任务行（回车确认 / Esc 取消） */}
+                {editingTaskAnchor && (
+                  <div className="task-anchor-edit">
+                    <input
+                      className="task-anchor-input"
+                      value={taskAnchorDraft}
+                      onChange={(e) => setTaskAnchorDraft(e.target.value)}
+                      placeholder={t("app.taskPlaceholder")}
+                      autoFocus
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && taskAnchorDraft.trim()) {
+                          const text = taskAnchorDraft.trim();
+                          // 基于完整列表追加（保留其他会话任务），新任务绑定当前会话
+                          persistTaskAnchors([
+                            ...taskAnchors,
+                            {
+                              id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                              text,
+                              status: "doing" as TaskAnchorStatus,
+                              updatedAt: Date.now(),
+                              // 新任务绑定当前会话：切会话后各看各的（无 sessionId 的旧数据保持全局）
+                              ...(activeAgent?.sessionId ? { sessionId: activeAgent.sessionId } : {}),
+                            },
+                          ]);
+                          setEditingTaskAnchor(false);
+                        }
+                        if (e.key === "Escape") setEditingTaskAnchor(false);
+                      }}
+                      onBlur={() => setEditingTaskAnchor(false)}
+                    />
+                  </div>
+                )}
+                <button
+                  className="task-anchor-add"
+                  onClick={() => {
+                    setTaskAnchorDraft("");
+                    setEditingTaskAnchor((v) => !v);
+                  }}
+                >
+                  <Plus size={12} aria-hidden="true" />
+                  {t("app.addTask")}
+                </button>
+                {/* 任务状态操作：点任务文字循环推进状态（进行中→未确认→已完成→进行中） */}
+                {anchorList.length > 0 && (
+                  <div className="task-anchor-status-row">
+                    {anchorList.map((t) => (
+                      <span
+                        key={t.id}
+                        className={`task-anchor-status-chip ${t.status}`}
+                        title={`${t.text}（点击切换状态）`}
+                        onClick={() =>
+                          // 基于完整列表修改状态（保留其他会话任务），只改当前可见任务的 id
+                          persistTaskAnchors(
+                            taskAnchors.map((x) =>
+                              x.id === t.id
+                                ? { ...x, status: cycleStatus(x), updatedAt: Date.now() }
+                                : x,
+                            ),
+                          )
+                        }
+                      >
+                        <span className="task-anchor-status-chip-text">{t.text}</span>
+                        <X
+                          size={10}
+                          className="task-anchor-status-chip-del"
+                          aria-hidden="true"
+                          onClick={(ev) => {
+                            ev.stopPropagation();
+                            // 基于完整列表删除（保留其他会话任务）
+                            persistTaskAnchors(taskAnchors.filter((x) => x.id !== t.id));
+                          }}
+                        />
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
           {/* 扩展 widget 固定在输入框上方；Todo+Plan 合并成一张任务卡，内部分区区分来源。 */}
           {activeAgentId && extensionWidgetsByAgent[activeAgentId] && Object.keys(extensionWidgetsByAgent[activeAgentId]).length > 0 && (() => {
             const entries = Object.entries(extensionWidgetsByAgent[activeAgentId]);
@@ -8376,6 +8835,26 @@ export function App() {
               title={t("app.resizeComposer")}
               onPointerDown={startComposerResize}
             />
+            {/* 只读子会话查看：输入区显示「恢复会话」按钮，用户点击后才真正拉起 agent */}
+            {readonlyViewer && !activeAgentId && (
+              <div className="composer-restore-overlay">
+                <button
+                  className="composer-restore-btn"
+                  onClick={() => void restoreReadonlySession()}
+                >
+                  {t("app.restoreSessionAction")}
+                </button>
+              </div>
+            )}
+            {/* 历史/子会话恢复中：输入框被遮罩，提示“恢复会话”，agent 就绪后自动消失 */}
+            {isAgentStarting && (
+              <div className="composer-restore-overlay" aria-hidden="true">
+                <span className="composer-restore-spinner" />
+                {activeAgent?.sessionPath
+                  ? t("app.restoreSession")
+                  : t("app.agentStarting")}
+              </div>
+            )}
             <RichInput
               ref={composerTextareaRef}
               value={prompt}
@@ -8856,6 +9335,15 @@ export function App() {
                 >
                   {t("drawer.tabBrowser")}
                 </button>
+                <button
+                  type="button"
+                  role="tab"
+                  className={`drawer-tab${drawerContentPanel === "memory" ? " active" : ""}`}
+                  aria-selected={drawerContentPanel === "memory"}
+                  onClick={() => switchToolDrawer("memory")}
+                >
+                  {t("drawer.tabMemory")}
+                </button>
               </div>
               <div className="drawer-header-actions">
                 <button
@@ -8947,6 +9435,20 @@ export function App() {
                 ) : (
                   <div className="config-empty">{t("drawer.sourceControl")}</div>
                 )}
+              </div>
+            )}
+
+            {drawerContentPanel === "memory" && (
+              <div className="drawer-content-frame">
+                <AppErrorBoundary
+                  title={t("drawer.memoryPanelError")}
+                  onReset={() => {}}
+                >
+                  <MemoryPanel
+                    getSessionMessages={() => activeMessages}
+                    workspaceId={activeProject?.path ?? null}
+                  />
+                </AppErrorBoundary>
               </div>
             )}
 
@@ -9143,10 +9645,10 @@ export function App() {
                 refreshSessions(sessionsProjectId ?? activeProjectId)
               }
               onOpenSession={(session) =>
-                createAgent(
+                // 统一走 openSidebarSession：已有 agent 切回 / 子会话只读 / 主会话激活
+                void openSidebarSession(
                   sessionsProjectId ?? activeProjectId ?? "",
-                  session.filePath,
-                  session.name,
+                  session,
                 )
               }
               onRenameSession={async (filePath, newName) => {

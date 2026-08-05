@@ -143,6 +143,8 @@ let previewSettings: AppSettings = {
 	desktopProxyUrl: "http://127.0.0.1:7890",
 	desktopProxyBypass: "localhost,127.0.0.1,::1",
 	customPiPath: "",
+	memoryInjectionEnabled: true,
+	memoryInjectionTopK: 3,
 	wslEnabled: false,
 	wslDistro: "Ubuntu",
 	wslUser: "root",
@@ -151,6 +153,8 @@ let previewSettings: AppSettings = {
 	webServiceHost: "0.0.0.0",
 	webServicePort: 8765,
 	rpcTimeout: 600_000,
+	domAgentExtensionPath: "C:/kaifa/dom-agent-extension/extension",
+	domAgentBarVisible: true,
 	linkOpenMode: "external",
 	contentMaxWidth: 1400,
 	maxEditorFileSizeMB: 5,
@@ -318,6 +322,11 @@ export function createPreviewApi(): PiDesktopApi {
 			],
 			readSessionMeta: async () => ({}),
 			readChatMessages: async () => [],
+		},
+		taskAnchor: {
+			load: async () => [],
+			save: async (tasks) => tasks,
+			onChanged: () => () => undefined,
 		},
 		codexSessions: {
 			scan: async () => [],
@@ -874,6 +883,10 @@ export function createPreviewApi(): PiDesktopApi {
 		},
 		browser: {
 			openExternal: async () => {},
+			openWindow: async () => {},
+			sendLightSelect: async () => {},
+			onLightSelect: () => () => {},
+			getGuestPreloadPath: async () => "",
 		},
 		scratchPad: {
 			list: async () => [],
@@ -882,6 +895,29 @@ export function createPreviewApi(): PiDesktopApi {
 			load: async () => ({ content: "", lastEditedAt: 0, cursorPosition: 0 }),
 			save: async () => {},
 			export: async () => false,
+		},
+
+		memory: {
+			list: async () => [],
+			get: async () => null,
+			add: async (_input) => ({ id: "", path: "", category: "memory", l0: "", l1: "", l2: "", priority: "P1", tags: [], parentDir: "memories", createdAt: 0, lastAccessedAt: 0, accessCount: 0, expiresAt: null, source: "user", workspaceId: null }),
+			update: async () => false,
+			remove: async () => false,
+			search: async () => [],
+			extract: async () => ({ status: "no_model", message: "preview 模式不可用" }),
+			pin: async () => false,
+			stats: async () => ({
+				total: 0, memories: 0, skills: 0, resources: 0,
+				byPriority: { P0: 0, P1: 0, P2: 0 },
+				expiringSoon: 0, dbPath: "",
+				byFreshness: { last24h: 0, last7d: 0, last30d: 0, older: 0 },
+				experience: 0, trajectories: 0,
+				accessTop: [], expiringSoonList: [],
+			}),
+			l0Index: async () => ({ text: "", memoryEntries: [] }),
+			lifecycle: async () => ({ purged: 0, duplicatesRemoved: 0 }),
+			onChanged: () => () => {},
+			onExtractionEvent: () => () => {},
 		},
 
 		clipboard: {

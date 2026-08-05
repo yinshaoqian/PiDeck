@@ -6,6 +6,8 @@ const pngToIcoModule = require('png-to-ico');
 const pngToIco = pngToIcoModule.default ?? pngToIcoModule;
 
 const svg = fs.readFileSync(path.join(__dirname, '..', 'build', 'icon.svg'), 'utf8');
+// 红色变体（开发环境/自建版本标识，社区版保持绿色）
+const redSvg = fs.readFileSync(path.join(__dirname, '..', 'build', 'icon-red.svg'), 'utf8');
 
 const out = path.join(__dirname, '..', 'build');
 const iconsDir = path.join(out, 'icons');
@@ -25,10 +27,10 @@ const icnsSources = [
   [1024, 'ic10'],
 ];
 
-async function renderPng(size, target) {
+async function renderPng(size, target, svgSource = svg) {
   let innerSize = Math.max(1, Math.round(size * iconContentRatio));
   if (innerSize > 1) innerSize -= innerSize % 2;
-  const icon = await sharp(Buffer.from(svg))
+  const icon = await sharp(Buffer.from(svgSource))
     .resize(innerSize, innerSize)
     .png()
     .toBuffer();
@@ -84,6 +86,10 @@ async function main() {
   const ico = await pngToIco([16, 24, 32, 48, 64, 128, 256].map(size => path.join(iconsDir, `${size}x${size}.png`)));
   await fs.promises.writeFile(path.join(out, 'icon.ico'), ico);
   await writeIcns(path.join(out, 'icon.icns'));
+
+  // 红色变体：托盘/窗口用 icon-red.png（512 大图，运行时按需 resize），
+  // 供开发模式（app.isPackaged === false）与绿色社区版区分。
+  await renderPng(512, path.join(out, 'icon-red.png'), redSvg);
 
   console.log('wrote build/icon.svg, build/icon.png, build/icon.ico, build/icon.icns and build/icons/*.png');
 }

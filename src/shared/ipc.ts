@@ -227,6 +227,34 @@ export const ipcChannels = {
 	/** 快速测试 provider 连接：发送一条最小请求验证 baseUrl/apiKey/模型 是否正常 */
 	configTestProvider: "config:test-provider",
 
+	// ── Viking 记忆系统 ───────────────────────────────────
+	/** 列出记忆（按类别/优先级过滤） */
+	memoryList: "memory:list",
+	/** 读取单条记忆详情 */
+	memoryGet: "memory:get",
+	/** 手动新增记忆（source=user） */
+	memoryAdd: "memory:add",
+	/** 更新记忆内容（可改 l0/l1/l2/priority/tags/metadata） */
+	memoryUpdate: "memory:update",
+	/** 删除记忆 */
+	memoryRemove: "memory:remove",
+	/** 关键词检索记忆（Viking 打分：L0/L1/tags/锚点 + 优先级权重 + 时间衰减） */
+	memorySearch: "memory:search",
+	/** 从会话消息提取记忆（LLM 提取 + 去重，完整 Viking 流程） */
+	memoryExtract: "memory:extract",
+	/** 手动钉住/取消钉住（P0） */
+	memoryPin: "memory:pin",
+	/** 记忆统计（总数/类别/优先级/临近过期） */
+	memoryStats: "memory:stats",
+	/** 生成 L0 摘要索引（上下文注入用，仿 viking:// 索引） */
+	memoryL0Index: "memory:l0-index",
+	/** 主进程 → 渲染进程：记忆数据变化实时推送 */
+	memoryChanged: "memory:changed",
+	/** 提取任务进度（主进程 → 渲染进程） */
+	memoryExtractionEvent: "memory:extraction-event",
+	/** 运行生命周期清理（过期/垃圾去重） */
+	memoryLifecycle: "memory:lifecycle",
+
 	/** 切换开发者控制台 */
 	appToggleDevTools: "app:toggle-devtools",
 
@@ -317,12 +345,24 @@ export const ipcChannels = {
 	scratchPadSave: "scratch-pad:save",
 	scratchPadExport: "scratch-pad:export",
 
+	// ===== Task Anchor（任务锚：当前任务列表，持久化 + Agent 联动） =====
+	taskAnchorLoad: "task-anchor:load",
+	taskAnchorSave: "task-anchor:save",
+	/** 主进程 → renderer：任务锚变化（Agent 工具更新后实时推送） */
+	taskAnchorChanged: "task-anchor:changed",
+
 	// ── 调试工具 ──
 	/** 设置面板 → 主进程：发送测试通知（调试弹窗样式） */
 	petTestNotify: "pet:test-notify",
 
 	// ===== 内置浏览器 =====
 	browserOpenExternal: "browser:open-external",
+	/** 弹出独立浏览器窗口（带当前 URL，渲染进程以 ?floating=browser 模式加载） */
+	browserOpenWindow: "browser:open-window",
+	/** 浏览器选中 DOM 元素信息：独立窗口 → 主进程 → 主窗口（填入聊天输入框） */
+	browserLightSelect: "browser:light-select",
+	/** 获取 webview guest preload 文件路径（错误捕获注入，页面最早阶段运行） */
+	browserGetGuestPreloadPath: "browser:get-guest-preload-path",
 
 	// ===== 系统文件选择器 =====
 	/** 打开系统原生文件/文件夹选择器，返回选中路径列表 */

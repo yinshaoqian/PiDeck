@@ -26,6 +26,15 @@ import type {
 	CreateAgentInput,
 	CreatePiSkillInput,
 	CreateProjectSkillInput,
+	MemoryCategory,
+	MemoryCreateInput,
+	MemoryExtractInput,
+	MemoryExtractionEvent,
+	TaskAnchorItem,
+	MemoryL0Compact,
+	MemoryNode,
+	MemorySearchResult,
+	MemoryStats,
 	ProjectResourceListResult,
 	PetAggregateState,
 	PetManifest,
@@ -1211,6 +1220,23 @@ const api = {
 		 *  用于 webview 不支持或需要另开浏览器查看的场景。 */
 		openExternal: (url: string) =>
 			ipcRenderer.invoke(ipcChannels.browserOpenExternal, url) as Promise<void>,
+		/** 弹出独立浏览器窗口（宽度不受侧边栏限制），传入当前页面 URL。 */
+		openWindow: (url: string) =>
+			ipcRenderer.invoke(ipcChannels.browserOpenWindow, url) as Promise<void>,
+		/** 独立浏览器窗口：把选中的元素信息发给主窗口（填入聊天输入框）。 */
+		sendLightSelect: (info: unknown) =>
+			ipcRenderer.send(ipcChannels.browserLightSelect, info),
+		/** 主窗口：接收独立窗口发来的元素选择信息（返回取消订阅函数）。 */
+		onLightSelect: (callback: (info: unknown) => void) => {
+			const listener = (_event: Electron.IpcRendererEvent, info: unknown) => callback(info);
+			ipcRenderer.on(ipcChannels.browserLightSelect, listener);
+			return () => {
+				ipcRenderer.removeListener(ipcChannels.browserLightSelect, listener);
+			};
+		},
+		/** webview guest preload 路径（file:// URL，错误捕获在页面最早阶段注入）。 */
+		getGuestPreloadPath: () =>
+			ipcRenderer.invoke(ipcChannels.browserGetGuestPreloadPath) as Promise<string>,
 	},
 
 	scratchPad: {
@@ -1226,6 +1252,46 @@ const api = {
 			ipcRenderer.invoke(ipcChannels.scratchPadSave, draftPath, content, cursorPosition) as Promise<void>,
 		export: (draftPath: string) =>
 			ipcRenderer.invoke(ipcChannels.scratchPadExport, draftPath) as Promise<boolean>,
+	},
+	memory: {
+		list: (opts?: { scope?: "all" | "global" | "workspace"; category?: MemoryCategory }) =>
+			ipcRenderer.invoke(ipcChannels.memoryList, opts) as Promise<MemoryNode[]>,
+		get: (id: string) =>
+			ipcRenderer.invoke(ipcChannels.memoryGet, id) as Promise<MemoryNode | null>,
+		add: (input: MemoryCreateInput) =>
+			ipcRenderer.invoke(ipcChannels.memoryAdd, input) as Promise<MemoryNode>,
+		update: (id: string, patch: Partial<MemoryNode>) =>
+			ipcRenderer.invoke(ipcChannels.memoryUpdate, id, patch) as Promise<boolean>,
+		remove: (id: string) =>
+			ipcRenderer.invoke(ipcChannels.memoryRemove, id) as Promise<boolean>,
+		search: (query: string, opts?: { scope?: "all" | "global" | "workspace"; category?: MemoryCategory; topK?: number }) =>
+			ipcRenderer.invoke(ipcChannels.memorySearch, query, opts) as Promise<MemorySearchResult[]>,
+		extract: (input: MemoryExtractInput) =>
+			ipcRenderer.invoke(ipcChannels.memoryExtract, input) as Promise<{
+				status: string;
+				created?: number;
+				merged?: number;
+				skipped?: number;
+				message?: string;
+			}>,
+		pin: (id: string, pinned: boolean) =>
+			ipcRenderer.invoke(ipcChannels.memoryPin, id, pinned) as Promise<boolean>,
+		stats: () =>
+			ipcRenderer.invoke(ipcChannels.memoryStats) as Promise<MemoryStats>,
+		l0Index: (opts?: { budget?: number; includeResources?: boolean }) =>
+			ipcRenderer.invoke(ipcChannels.memoryL0Index, opts) as Promise<MemoryL0Compact>,
+		lifecycle: () =>
+			ipcRenderer.invoke(ipcChannels.memoryLifecycle) as Promise<{ purged: number; duplicatesRemoved: number }>,
+		onChanged: (callback: () => void) => subscribe(ipcChannels.memoryChanged, callback),
+		onExtractionEvent: (callback: (ev: MemoryExtractionEvent) => void) => subscribe(ipcChannels.memoryExtractionEvent, callback),
+	},
+	taskAnchor: {
+		load: () =>
+			ipcRenderer.invoke(ipcChannels.taskAnchorLoad) as Promise<TaskAnchorItem[]>,
+		save: (tasks: TaskAnchorItem[]) =>
+			ipcRenderer.invoke(ipcChannels.taskAnchorSave, tasks) as Promise<TaskAnchorItem[]>,
+		/** 扩展/其他进程写文件后主进程推送刷新事件 */
+		onChanged: (callback: () => void) => subscribe(ipcChannels.taskAnchorChanged, callback),
 	},
 };
 

@@ -242,9 +242,10 @@ export class SessionScanner {
       this.activeScanRoots = scanRoots;
 
       // WSL 模式 vs 本地模式：互斥扫描，不会同时展示两个环境的会话。
+      // 本地模式传 projectPath 做分区预过滤（见 collectFromRootsLocal）。
       const files = this.wslConfig
         ? await this.collectFromRootsWsl(scanRoots, signal).catch(rethrowAbort([] as string[]))
-        : await this.collectFromRootsLocal(scanRoots);
+        : await this.collectFromRootsLocal(scanRoots, normalizedProjectPath);
       const fileSetKey = [...files].sort().join("\n");
       if (fileSetKey !== this.summaryCacheFileSetKey) {
         // 仅修剪当前环境下已消失文件，保留未变化会话的摘要命中（含磁盘恢复的条目）。
@@ -402,11 +403,17 @@ export class SessionScanner {
     });
   }
 
-  private async collectFromRootsLocal(roots: string[]): Promise<string[]> {
+  private async collectFromRootsLocal(roots: string[], projectPath?: string): Promise<string[]> {
     const all: string[] = [];
     const seen = new Set<string>();
     for (const root of roots) {
-      const files = await this.collectJsonl(root).catch(() => [] as string[]);
+      // 项目已知时只收集目标分区，避免把全局 sessions 目录下其它项目的会话
+      // （含 subagent run-* 子会话）全部收集+解析——跨项目大目录会占满主进程
+      // 事件循环，间接导致 pi 的 RPC 响应（stdout data 事件）无法及时消费，
+      // 表现为 agent 创建 get_state 假超时（进程活着但几十秒无响应）。
+      const files = projectPath
+        ? await this.collectJsonlForProject(root, projectPath)
+        : await this.collectJsonl(root);
       for (const file of files) {
         const key = this.normalize(file);
         if (seen.has(key)) continue;
@@ -415,6 +422,28 @@ export class SessionScanner {
       }
     }
     return all;
+  }
+
+  /**
+   * 只收集目标项目分区的会话文件。
+   * pi 的默认存储布局是 ~/.pi/agent/sessions/<encoded-cwd>/...，顶层目录名即项目分区
+   * （如 --C--kaifa-web-tracing-docs--）。subagent 子会话嵌套在分区内，随分区一并收集。
+   */
+  private async collectJsonlForProject(root: string, projectPath: string): Promise<string[]> {
+    const token = this.safePathToken(projectPath);
+    const entries = await readdir(root, { withFileTypes: true });
+    const files: string[] = [];
+    for (const entry of entries) {
+      const path = join(root, entry.name);
+      if (entry.isDirectory() && entry.name.toLowerCase().includes(token)) {
+        // token 为粗筛（可能误匹配相似目录名），后续 isSameProject 仍会精确过滤。
+        files.push(...await this.collectJsonl(path));
+      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        // 根目录直接放置的 jsonl（罕见布局）保留，兼容旧数据。
+        files.push(path);
+      }
+    }
+    return files;
   }
 
   private async collectFromRootsWsl(roots: string[], signal?: AbortSignal): Promise<string[]> {
@@ -989,6 +1018,8 @@ export class SessionScanner {
     let latestSessionInfoName: string | undefined;
     let forkParentSession: string | undefined;
     let hasSubagentChildMarker = false;
+    /** 最后一条 assistant 消息文本，用于判定子会话完成状态（✅/⚠️/❌ 汇报格式） */
+    let lastAssistantText = "";
 
     for (const line of lines) {
       const entry = JSON.parse(line) as any;
@@ -1025,10 +1056,15 @@ export class SessionScanner {
       const message = entry.message ?? entry.data?.message ?? entry;
       if (message?.role) {
         messageCount += 1;
-        const text = this.extractText(message.content).trim();
+        // 剥离宿主指令包裹体：PiDeck 主进程每轮把任务锚状态/强制登记规则拼进 user 消息
+        // （[PIDECK_HOST_INSTRUCTION]...[/PIDECK_HOST_INSTRUCTION]），若直接进标题/预览/摘要，
+        // 会话名会变成机器指令文本（用户反馈「每个标题都加了这玩意」）。
+        const text = this.stripHostInstruction(this.extractText(message.content)).trim();
         if (text && preview === "空会话") preview = text;
         if (text && message.role === "user" && !firstUserText) firstUserText = text;
         if (text && message.role === "assistant" && !firstAssistantText) firstAssistantText = text;
+        // 持续跟踪最后一条 assistant 消息；子会话完成汇报的状态标记（✅/⚠️/❌）位于其中
+        if (message.role === "assistant" && text) lastAssistantText = text;
       }
     }
 
@@ -1102,6 +1138,23 @@ export class SessionScanner {
     // 旧版 PiDeck 的 sessionName 私有行及其他字段仅作降级回退。
     const inferredName = this.cleanTitle(latestSessionInfoName) || this.cleanTitle(name) || this.cleanTitle(firstUserText) || this.cleanTitle(firstAssistantText) || "Untitled";
 
+    // 子会话运行状态标记：仅对判定为子会话的文件计算。
+    // pi-subagents 约定子 agent 汇报格式包含 ✅ 已完成 / ⚠️ 需关注 / ❌ 失败；
+    // 无 assistant 回复说明刚派发还在运行。非子会话不设该字段。
+    let subagentStatus: SessionSummary["subagentStatus"];
+    if (parentSessionPath) {
+      if (!lastAssistantText) {
+        subagentStatus = "running";
+      } else if (lastAssistantText.includes("❌")) {
+        subagentStatus = "failed";
+      } else if (lastAssistantText.includes("⚠️")) {
+        subagentStatus = "attention";
+      } else {
+        // 有回复但无显式标记：视为完成（汇报格式约定必有标记，此处兜底）
+        subagentStatus = "completed";
+      }
+    }
+
     const summary: SessionSummary = {
       id: filePath,
       filePath,
@@ -1117,6 +1170,8 @@ export class SessionScanner {
       codexAgentRole,
       codexAgentNickname,
       parentSessionPath,
+      // 子会话运行状态标记（仅子会话有值）
+      subagentStatus,
       // 标记 WSL 来源，供 rename/delete/copy/readMessages 等操作识别
       wsl: isWsl || undefined,
     };
@@ -1160,6 +1215,19 @@ export class SessionScanner {
       }).filter(Boolean).join(" ");
     }
     return "";
+  }
+
+  /** 剥离 PiDeck 宿主指令包裹体：主进程每轮注入的 [PIDECK_HOST_INSTRUCTION]...[/PIDECK_HOST_INSTRUCTION]
+   *  是给 agent 看的机器指令，不应进入会话标题/预览/摘要等用户可见文本。 */
+  private stripHostInstruction(text: string): string {
+    const START = "[PIDECK_HOST_INSTRUCTION]";
+    const END = "[/PIDECK_HOST_INSTRUCTION]";
+    const start = text.indexOf(START);
+    const end = text.indexOf(END);
+    if (start !== -1 && end !== -1 && end > start) {
+      return (text.slice(0, start) + " " + text.slice(end + END.length)).trim();
+    }
+    return text;
   }
 
   private cleanTitle(value?: string) {

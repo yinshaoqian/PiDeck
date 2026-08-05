@@ -116,6 +116,14 @@ export class PiLocator {
       PATH: searchDirs.join(delimiter),
     });
 
+    // 注入 PiDeck userData 路径：pi 进程内扩展（如 pi-deck-memory）据此定位
+    // viking.db 记忆库，实现跨会话记忆召回。不传 WSL（WSL 内无法访问 Windows userData）。
+    try {
+      env.PIDECK_USER_DATA = app.getPath("userData");
+    } catch {
+      // userData 不可用时静默跳过，扩展回退到默认路径
+    }
+
     return this.applyPiProxyEnv(env, settings);
   }
 

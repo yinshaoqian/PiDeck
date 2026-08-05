@@ -12,6 +12,7 @@ import type {
 	CreateAgentInput,
 	ForkMessage,
 	ImageContent,
+	MemoryInjectionEntry,
 	Project,
 	SendPromptInput,
 	SendPromptResult,
@@ -75,6 +76,11 @@ export class AgentManager {
 	private readonly activeToolCallsByAgent = new Map<string, Map<string, string>>();
 	/** 记录每个 agent 当前执行的工具名称，无工具时为 null */
 	private readonly toolExecutingByAgent = new Map<string, string | null>();
+	/** 本会话累计记忆注入条数（触发式注入命中计数，供顶部状态栏展示） */
+	private readonly memoryInjectedByAgent = new Map<string, number>();
+	/** 最近触发式记忆注入的条目日志：agentId → 最近注入的记忆（最新在前，截断保留 30 条）。
+	 * 与计数同生命周期（Map 随 runtime），供“查看注入了什么”弹窗展示。 */
+	private readonly memoryInjectionLogByAgent = new Map<string, MemoryInjectionEntry[]>();
 	/** 缓存每个 agent 的 entryId → JSONL 行号映射，用于编辑/删除定位。每次 loadMessages 后刷新。 */
 	private readonly entryIdToLineMap = new Map<string, Map<string, number>>();
 	/** 每个 agent 的会话文件写入锁，防止并发 readFile→modify→writeFile 操作破坏 JSONL 文件 */
@@ -167,6 +173,8 @@ export class AgentManager {
 		private readonly configManager: ConfigManager,
 		private readonly rpcLogger?: RpcLogger,
 		private readonly appLogger?: AppLogger,
+		/** agent 真正空闲（agent_settled，非 abort/error）时回调——用于任务锚自动回写等 */
+		private readonly onAgentSettled?: (agentId: string) => void,
 	) {}
 
 	configureWsl(environment: WslEnvironment | null): void {
@@ -805,9 +813,10 @@ export class AgentManager {
 		// 添加自动重试机制补偿 pi 初始化期间的瞬时延迟（如系统负载高、会话语料加载慢、
 		// 反病毒扫描），避免一次超时就永久标记为启动失败——用户反馈重启即可恢复说明进程本身正常。
 		void this.appLogger?.info("agent", "Agent get_state request start", { agentId: id });
-		// 单次 get_state 超时 45s，配合重试覆盖 pi 初始化期间的瞬时延迟。
-		const GET_STATE_TIMEOUT_MS = 45_000;
-		const GET_STATE_RETRIES = 2;
+		// 单次 get_state 超时 25s + 1 次重试：覆盖绝大多数正常启动（2.5-15s）与瞬时抖动。
+		// get_state 已改为后台收敛（见下方注释），长时间等待不会再阻塞 UI，无需 45s×3 的长链（最坏 141s）。
+		const GET_STATE_TIMEOUT_MS = 25_000;
+		const GET_STATE_RETRIES = 1;
 		const GET_STATE_RETRY_DELAY_MS = 2_000;
 		void this.appLogger?.info("agent", "Agent get_state retry config", {
 			agentId: id,
@@ -841,9 +850,18 @@ export class AgentManager {
 		})();
 		const historyLoadDecision = this.getHistoryAutoLoadDecision(input.sessionPath);
 
+		// 关键优化：进程 spawn 成功即返回 starting tab，不再阻塞等待 get_state。
+		// 此前实现等 get_state 成功才返回，而 pi RPC 进程在完成内部初始化（扩展加载、
+		// 会话扫描等）前不会读取 stdin，get_state 响应时间≈pi 初始化耗时（用户环境可达
+		// 数十秒，偶发触发 45s 超时+重试，最坏 141s）。这导致“点创建”在 UI 上干等，
+		// 且 renderer 60s 硬超时会先触发造成状态分裂。改为后台收敛：
+		// UI 立即显示 starting 骨架屏（renderer 已支持输入禁用），状态经 agents:state 事件推送。
+		void (async () => {
 		try {
 			void this.appLogger?.info("agent", "Agent get_state request completed", { agentId: id });
 			const state = await statePromise;
+			// 后台收敛期间用户可能已 stop 该 agent（已从 agents map 删除），此时不再回写状态，避免僵尸状态。
+			if (this.agents.get(id) !== runtime) return;
 			const t4 = Date.now();
 			void this.appLogger?.info("agent", "Agent get_state completed", {
 				agentId: id,
@@ -952,6 +970,8 @@ export class AgentManager {
 				historyLoading: "background",
 			});
 		} catch (error) {
+			// 后台收敛失败时同样跳过已停止的 agent。
+			if (this.agents.get(id) !== runtime) return;
 			tab.status = "error";
 			const rawMessage = error instanceof Error ? error.message : String(error);
 			void this.appLogger?.error("agent", "Agent create failed", {
@@ -966,6 +986,10 @@ export class AgentManager {
 			this.addMessage(id, "error", this.buildStartupFailureMessage(rawMessage, process.getDiagnostics()));
 		}
 
+		this.emitState();
+		})();
+
+		// 立即返回 starting tab，让 UI 秒级响应；最终状态由上方后台 IIFE 收敛后经 agents:state 推送。
 		this.emitState();
 		return tab;
 	}
@@ -1585,6 +1609,8 @@ export class AgentManager {
 					: undefined,
 			cacheHitPercent,
 			cost: stats?.cost,
+			memoryInjectedCount: this.memoryInjectedByAgent.get(agentId) ?? 0,
+			memoryInjectedDetails: this.memoryInjectionLogByAgent.get(agentId),
 		};
 	}
 
@@ -2223,6 +2249,8 @@ export class AgentManager {
 			// 3. Re-parenting：将删掉 entry 的所有直接子节点的 parentId 指向被删 entry 的父节点。
 			// 这样 pi 在 switch_session 重载 session tree 时，子节点不会因为
 			// 父节点消失而变成 dangling orphan，避免 pi 丢弃整个子分支（“删一条丢多条”）。
+			// 同时统计是否存在子节点：无子节点的叶子消息直接物理删除该行（见步骤 4）。
+			let hasChildren = false;
 			if (deletedEntryId && deletedParentId !== undefined) {
 				for (let i = 0; i < lines.length; i++) {
 					if (i === lineIndex) continue;
@@ -2231,6 +2259,7 @@ export class AgentManager {
 					try {
 						const child = JSON.parse(childLine);
 						if (child.parentId === deletedEntryId) {
+							hasChildren = true;
 							child.parentId = deletedParentId;
 							lines[i] = JSON.stringify(child);
 						}
@@ -2238,13 +2267,18 @@ export class AgentManager {
 				}
 			}
 
-			// 4. 用 deleted 标记替换原行（不保留 id 字段，
-			// 避免 pi 的 get_entries 返回已删 entry 导致 activeEntryIds 与 messages 不匹配）
-			lines[lineIndex] = JSON.stringify({
-				type: "deleted",
-				originalEntryId: deletedEntryId ?? `unknown-${messageId}`,
-				ts: Date.now(),
-			});
+			// 4. 叶子消息（无子节点）物理删除该行：避免文件尾部残留 deleted 标记导致
+			// pi 在 switch_session 重载时解析异常、整份会话返回空消息（“删最后一条全没”）。
+			// 有子节点时才用 deleted 标记替换（子节点已在上一步重挂到父节点）。
+			if (!hasChildren) {
+				lines.splice(lineIndex, 1);
+			} else {
+				lines[lineIndex] = JSON.stringify({
+					type: "deleted",
+					originalEntryId: deletedEntryId ?? `unknown-${messageId}`,
+					ts: Date.now(),
+				});
+			}
 			await writeFile(sessionHostPath, lines.join("\n"), "utf8");
 
 			// 5. 使用 _reloadMarker 重载 pi 会话
@@ -3237,6 +3271,8 @@ export class AgentManager {
 			// 通知 stream gate：abort 对应的 settled 已到。
 			// 若 settled 前已有 agent_start（用户立刻重发），此处才真正解封；
 			// 若还没有新 start，则保持封印，防止 settled 后残留 delta 复活旧气泡。
+			// 记录 settled 前是否处于 abort 状态：abort 结束不触发任务锚自动回写（用户主动停≠完成）。
+			const settledFromAbort = this.recentlyAborted.has(agentId);
 			this.noteAgentAbortSettled(agentId);
 			this.recentlyAborted.delete(agentId);
 			if (runtime && runtime.tab.status !== "error" && runtime.tab.status !== "closed") {
@@ -3253,6 +3289,12 @@ export class AgentManager {
 				this.emitThinking(agentId, "");
 				this.emitState();
 				void this.emitRuntimeState(agentId);
+
+				// 任务锚自动回写：agent 真正空闲（正常结束，非 abort/error）时通知外部，
+				// 由 index.ts 把进行中任务标为“调研完成·未确认”——不依赖 agent 调工具。
+				if (!settledFromAbort) {
+					this.onAgentSettled?.(agentId);
+				}
 
 				const messages = this.messages.get(agentId) ?? [];
 				const lastMessage = messages[messages.length - 1];
@@ -4729,6 +4771,22 @@ export class AgentManager {
 	private emitThinkingNow(agentId: string, thinking: string) {
 		const update: ThinkingUpdate = { agentId, thinking };
 		this.emit(ipcChannels.agentsThinking, update);
+	}
+
+	/**
+	 * 记录一次触发式记忆注入命中，并刷新运行时状态（顶部状态栏显示累计条数）。
+	 * 计数按 agent 会话累计，切换会话后重新从 0 开始（Map 随 runtime 生命周期）；
+	 * 详情同样按 agent 保留最近注入条目，供“查看注入了什么”弹窗使用。
+	 */
+	recordMemoryInjection(agentId: string, count: number, entries: MemoryInjectionEntry[] = []) {
+		if (count <= 0) return;
+		this.memoryInjectedByAgent.set(agentId, (this.memoryInjectedByAgent.get(agentId) ?? 0) + count);
+		if (entries.length > 0) {
+			// 最新注入的条目放最前，便于弹窗一眼看到最近一次注入了什么；截断防无限增长
+			const prev = this.memoryInjectionLogByAgent.get(agentId) ?? [];
+			this.memoryInjectionLogByAgent.set(agentId, [...entries, ...prev].slice(0, 30));
+		}
+		void this.emitRuntimeState(agentId);
 	}
 
 	private emitState() {

@@ -64,3 +64,11 @@ video-series/decks/assets/
 video-series/pipeline/EP0*/
 video-series/pipeline/demo/
 video-series/pipeline/*.mp4
+
+# Memory test artifacts
+scripts/.memtest/
+.memtest-db/
+
+# 临时测试库/脚本
+viking-copy.db
+*.db

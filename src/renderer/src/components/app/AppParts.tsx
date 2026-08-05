@@ -98,6 +98,8 @@ import {
 	UserPen,
 	// 会话 fork：从该用户消息切出新会话（对应 pi /fork），忙碌时不展示。
 	GitFork,
+	// 重新发送：把该条用户消息原样重发给当前 agent（不改写 composer）。
+	RotateCcw,
 } from "lucide-react";
 import { getFileIconSeti, getFileIconColor, getFileTypeLabel } from "../../fileIcons";
 import { normalizeSessionPathForCompare } from "../../agentListDisplay";
@@ -142,7 +144,7 @@ import removeMarkdown from "remove-markdown";
 /** 复用 petdex 标准网格规格，在主设置面板里为宠物选择器渲染单格动画预览 */
 import { GRID_COLS, CELL_W, CELL_H, MODE_ROW, MODE_FRAMES } from "../../pet/PetSpriteSheet";
 
-export type DrawerPanel = "files" | "sessions" | "browser" | "editor" | "git";
+export type DrawerPanel = "files" | "sessions" | "browser" | "editor" | "git" | "memory";
 
 export type SessionModifiedFile = {
 	path: string;
@@ -511,6 +513,8 @@ export function SessionStatus(props: {
 	duration?: number;
 }) {
 	const state = props.state;
+	// 记忆注入详情弹窗开关：顶部“记忆注入 N 条”chip 点击后查看本次/近期具体注入了哪些记忆
+	const [injectionOpen, setInjectionOpen] = useState(false);
 	if (!state) return null;
 	// 会话头部状态用轻量 Badge，与左右分栏/新会话按钮同一套素雅边框语言，
 	// 避免各 chip 自定义高度/圆角造成头部控件参差。
@@ -541,6 +545,26 @@ export function SessionStatus(props: {
 					)}
 				</Badge>
 			)}
+			{state.memoryInjectedCount != null && state.memoryInjectedCount > 0 && (
+				<Badge
+					variant="outline"
+					badgeSize="sm"
+					className="memory-chip"
+					title={t("app.memoryInjectedTitle")}
+					role="button"
+					tabIndex={0}
+					onClick={() => setInjectionOpen(true)}
+					onKeyDown={(e) => {
+						if (e.key === "Enter" || e.key === " ") {
+							e.preventDefault();
+							setInjectionOpen(true);
+						}
+					}}
+				>
+					{t("app.memoryInjected")}: {state.memoryInjectedCount}
+					<Eye size={12} strokeWidth={2} aria-hidden="true" />
+				</Badge>
+			)}
 			{state.cost != null && (
 				<Badge
 					variant="outline"
@@ -551,6 +575,73 @@ export function SessionStatus(props: {
 					${state.cost.toFixed(3)}
 				</Badge>
 			)}
+			{/* 记忆注入详情弹窗：展示本会话注入过的具体记忆条目（最新在前）。
+			 * 数据源是主进程注入时同源生成的结构化 entries，随 runtime state 推送，无需二次检索。 */}
+			<Modal
+				open={injectionOpen}
+				onClose={() => setInjectionOpen(false)}
+				title={t("app.memoryInjectedDetailTitle")}
+				size="medium"
+				className="memory-injection-modal"
+			>
+				<div className="memory-injection-detail">
+					<p className="memory-injection-detail-desc">
+						{t("app.memoryInjectedDetailDesc", { count: state.memoryInjectedCount })}
+					</p>
+					{(state.memoryInjectedDetails?.length ?? 0) > 0 ? (
+						<ul className="memory-injection-detail-list">
+							{state.memoryInjectedDetails?.map((entry) => (
+								<li key={entry.id} className="memory-injection-detail-item">
+									<span className={`memory-injection-prio memory-injection-prio-${entry.priority.toLowerCase()}`}>
+										{entry.priority}
+									</span>
+									<div className="memory-injection-detail-body">
+										<div className="memory-injection-detail-title">
+											<strong>{entry.l0}</strong>
+											<span className="memory-injection-detail-time">{entry.timeLabel}</span>
+										</div>
+										{entry.causal && (
+											<div className="memory-injection-causal">
+												{entry.causal.symptom && (
+													<div className="memory-injection-causal-row">
+														<em>{t("app.memoryInjectedCausalSymptom")}</em>
+														<span>{entry.causal.symptom}</span>
+													</div>
+												)}
+												{entry.causal.rootCause && (
+													<div className="memory-injection-causal-row">
+														<em>{t("app.memoryInjectedCausalRootCause")}</em>
+														<span>{entry.causal.rootCause}</span>
+													</div>
+												)}
+												{entry.causal.fix && (
+													<div className="memory-injection-causal-row">
+														<em>{t("app.memoryInjectedCausalFix")}</em>
+														<span>{entry.causal.fix}</span>
+													</div>
+												)}
+											</div>
+										)}
+										{entry.l1 && entry.l1 !== entry.l0 && (
+											<p className="memory-injection-detail-l1">{entry.l1}</p>
+										)}
+										{entry.hitTerms && entry.hitTerms.length > 0 && (
+											<div className="memory-injection-detail-hits">
+												<span className="memory-injection-detail-hits-label">{t("app.memoryInjectedHitTerms")}</span>
+												{entry.hitTerms.map((term) => (
+													<span key={term} className="memory-injection-detail-hit">{term}</span>
+												))}
+											</div>
+										)}
+									</div>
+								</li>
+							))}
+						</ul>
+					) : (
+						<p className="memory-injection-detail-empty">{t("app.memoryInjectedDetailEmpty")}</p>
+					)}
+				</div>
+			</Modal>
 		</div>
 	);
 }
@@ -564,6 +655,8 @@ const EXTENSION_WIDGET_COLLAPSED_KEY_PREFIX =
 export const MERGED_TASK_WIDGET_KEY = "pi-deck-task-board";
 export const TODO_WIDGET_KEY = "pi-deck-todo";
 export const PLAN_WIDGET_KEY = "pi-deck-plan-todos";
+/** 任务锚 widget key：复用 ExtensionWidgetCard 渲染当前聚焦任务列表 */
+export const TASK_ANCHOR_WIDGET_KEY = "pi-deck-task-anchor";
 
 export type ExtensionWidgetSection = {
 	/** 原始 widget key，关闭合并卡时用于逐个 dismiss */
@@ -610,6 +703,7 @@ export function ExtensionWidgetCard(props: {
 			[TODO_WIDGET_KEY]: t("app.widgetTodo"),
 			[PLAN_WIDGET_KEY]: t("app.widgetPlan"),
 			[MERGED_TASK_WIDGET_KEY]: t("app.widgetTodos"),
+			[TASK_ANCHOR_WIDGET_KEY]: t("app.currentTask"),
 		} as Record<string, string>)[props.widgetKey] ?? props.widgetKey;
 	const [expanded, setExpanded] = useState(() => {
 		if (typeof window === "undefined") return true;
@@ -1663,9 +1757,9 @@ export { PiLogoCanvas } from "./PiLogoCanvas";
 export function BrandLockup(props: { replayToken?: number } = {}) {
 	return (
 		<div className="brand-lockup" aria-label="PiDeck">
-			{/* 34px：比字标略大，仍保持侧栏紧凑 */}
+			{/* 10px：用户指定，更紧凑 */}
 			<PiLogoCanvas
-				size={34}
+				size={10}
 				autoPlay
 				playOnClick
 				replayToken={props.replayToken}
@@ -3338,7 +3432,15 @@ export const TurnRow = memo(function TurnRow(props: {
 	// 将最终消息的思考插入执行过程（放在工具之前），确保时序正确：思考→工具→文本
 	const executionItemsWithFinalThinking = useMemo(() => {
 		const items = [...executionItems];
-		if (hasFinalThinking && finalThinkingTxt && props.showThinking) {
+		// groupToolMessages 修复后，最后 assistant 的 thinking 已聚合进 thinking-group
+		// （thinking+text 同消息也会聚合）；此处仅当 thinking-group 未包含 final 消息
+		// 的 thinking 时才追加，避免重复显示最后一段思考。
+		const alreadyInThinkingGroup = items.some(
+			(i) =>
+				i.kind === "thinking-group" &&
+				(i as ThinkingGroupItem).messages?.some((m) => m.id === finalMessageItem?.message.id),
+		);
+		if (hasFinalThinking && finalThinkingTxt && props.showThinking && !alreadyInThinkingGroup) {
 			const thinkingItem: ThinkingGroupItem = {
 				kind: "thinking-group",
 				id: `final-thinking-${finalMessageItem?.message.id ?? run.id}`,
@@ -3670,6 +3772,8 @@ export const UserBubble = memo(function UserBubble(props: {
 	onDeleteMessage?: (messageId: string) => void;
 	/** 从该用户消息 fork 新会话；需 message.meta.entryId，忙碌时不展示入口 */
 	onForkMessage?: (message: ChatMessage) => void;
+	/** 原样重发该条用户消息给当前 agent（不经过 composer/编辑） */
+	onResendMessage?: (message: ChatMessage) => void;
 	validCommandNames?: Set<string>;
 	validFilePaths?: Set<string>;
 	/** Agent 正在处理请求或流式输出中时禁用编辑/删除等操作按钮 */
@@ -3831,6 +3935,14 @@ export const UserBubble = memo(function UserBubble(props: {
 							title={t("app.editAndResendTitle")}
 						>
 							<UserPen size={14} />
+						</button>
+						<button
+							className="user-turn-action-btn"
+							onClick={() => props.onResendMessage?.(message)}
+							title={t("app.resendMessageTitle")}
+							aria-label={t("app.resendMessage")}
+						>
+							<RotateCcw size={14} strokeWidth={1.8} aria-hidden="true" />
 						</button>
 						<button
 							className="user-turn-action-btn"
@@ -5888,6 +6000,17 @@ function SessionsPanel(props: {
 									<div className="session-card-title">
 										<strong>{child.name || t("common.untitled")}</strong>
 										<span className="session-source-badge subagent">{t("drawer.subagentSession")}</span>
+										{child.subagentStatus && (
+											<span className={`subagent-status-badge ${child.subagentStatus}`}>
+												{child.subagentStatus === "running"
+													? t("drawer.subagentStatusRunning")
+													: child.subagentStatus === "completed"
+														? t("drawer.subagentStatusCompleted")
+														: child.subagentStatus === "attention"
+															? t("drawer.subagentStatusAttention")
+															: t("drawer.subagentStatusFailed")}
+											</span>
+										)}
 										<small>
 											{new Date(child.updatedAt).toLocaleString()} ·{" "}
 											{t("drawer.sessionMessages", {

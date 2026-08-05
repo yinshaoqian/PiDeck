@@ -28,6 +28,14 @@ function normalizeDetail(detail: unknown) {
 export class AppLogger {
 	private readonly dir = join(app.getPath("userData"), "logs");
 	private writeQueue: Promise<void> = Promise.resolve();
+	/**
+	 * 惰性 mkdir：只在首次写日志时创建一次目录。
+	 * 洪流期间若每条日志都 mkdir({recursive:true})，会放大磁盘 IO（曾拖慢 pi 子进程启动）。
+	 */
+	private dirReady: Promise<void> | null = null;
+	/** 旧日志清理限频：避免每次 writeEntry 都 readdir 扫目录（洪流时同样放大磁盘 IO）。 */
+	private lastCleanupAt = 0;
+	private static readonly CLEANUP_INTERVAL_MS = 10 * 60_000;
 
 	log(level: AppLogLevel, scope: string, message: string, detail?: unknown) {
 		const entry: AppLogEntry = {
@@ -128,8 +136,21 @@ export class AppLogger {
 	}
 
 	private async writeEntry(entry: AppLogEntry) {
-		await mkdir(this.dir, { recursive: true });
-		await this.cleanupOldFiles();
+		// mkdir 只执行一次（首次写日志时），后续复用已就绪的目录。
+		if (!this.dirReady) {
+			// then 显式转为 void：mkdir 的返回值类型是 string，Promise 链需对齐到 Promise<void>。
+			this.dirReady = mkdir(this.dir, { recursive: true }).then(
+				() => undefined,
+				() => undefined,
+			);
+		}
+		await this.dirReady;
+		// cleanupOldFiles 限频：10 分钟最多清理一次，避免每次 append 前 readdir 扫目录。
+		const now = Date.now();
+		if (now - this.lastCleanupAt >= AppLogger.CLEANUP_INTERVAL_MS) {
+			this.lastCleanupAt = now;
+			await this.cleanupOldFiles();
+		}
 		const filePath = join(this.dir, `app-${formatDate(new Date(entry.time))}.log`);
 		await appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf8");
 	}

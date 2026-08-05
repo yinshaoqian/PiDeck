@@ -11,8 +11,11 @@ type SettingsProvider = () => AppSettings;
 /** PiDeck 内置扩展列表，用于在扫描不到时仍展示在扩展管理页中。 */
 export const BUILT_IN_EXTENSIONS = [
 	"pi-deck-ask-question.ts",
+	"pi-deck-memory.ts",
 	"pi-deck-nul-redirect-fix.ts",
 	"pi-deck-plan-mode.ts",
+	"pi-deck-task-anchor.ts",
+	"pi-deck-task-guard.ts",
 	"pi-deck-todo.ts",
 ] as const;
 

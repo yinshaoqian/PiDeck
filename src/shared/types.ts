@@ -132,6 +132,12 @@ export type SessionSummary = {
 	name?: string;
 	/** 子会话：关联的父会话文件路径。有该字段时不在会话列表顶层显示，而是嵌套在父会话下。 */
 	parentSessionPath?: string;
+	/**
+	 * 子会话运行状态标记（来自 pi-subagents 完成汇报格式：✅/⚠️/❌）。
+	 * 无 assistant 回复 = running（刚派发）；含 ✅ = completed；⚠️ = attention；❌ = failed。
+	 * 供左侧栏子会话条目显示状态徽标，也为后续按状态分组/筛选打基础。
+	 */
+	subagentStatus?: "running" | "completed" | "attention" | "failed";
 	preview: string;
 	updatedAt: number;
 	messageCount: number;
@@ -271,6 +277,10 @@ export type AgentRuntimeState = {
 	executingToolName?: string;
 	/** 工具状态事件的单调序号，用于忽略晚到的异步完整状态。 */
 	toolStateSequence?: number;
+	/** 本会话累计触发的记忆注入条数（触发式记忆注入命中数，0 表示从未命中） */
+	memoryInjectedCount?: number;
+	/** 最近触发式记忆注入的具体条目（「查看注入了什么」弹窗数据源，最近一次注入的最新在前） */
+	memoryInjectedDetails?: MemoryInjectionEntry[];
 	contextTokens?: number | null;
 	contextWindow?: number | null;
 	contextPercent?: number | null;
@@ -370,6 +380,17 @@ export type AppSettings = {
 	webServiceHost: string;
 	/** Web 服务监听端口 */
 	webServicePort: number;
+	/**
+	 * DOM Agent Link 扩展目录（未打包扩展根目录，含 manifest.json）。
+	 * 非空时，主进程会把该目录下的 content 脚本注入到内置浏览器 webview 页面。
+	 */
+	domAgentExtensionPath: string;
+	/**
+	 * 是否显示 DOM Agent 控制条（右下角浮动条）。
+	 * 关闭后注入时不再构建控制条/唤起胶囊 UI（Alt+Shift+D 选择能力仍保留），
+	 * 重新打开后需刷新窗口重新注入生效。
+	 */
+	domAgentBarVisible: boolean;
 	/** 本地生成的匿名安装标识，不包含账号、路径或机器名 */
 	telemetryInstallId?: string;
 	/** 最近一次发送 app_heartbeat 的本地日期，格式 YYYY-MM-DD */
@@ -386,6 +407,10 @@ export type AppSettings = {
 	maxEditorFileSizeMB: number;
 	/** 外部编辑器配置：首次异步检测后保存，用户可在设置中手动覆盖路径。 */
 	externalEditors: ExternalEditorSettings;
+	/** 触发式记忆注入：用户消息进入 pi 前，主进程按当前消息+会话上下文自动检索 viking.db 并注入 top-N 相关记忆 */
+	memoryInjectionEnabled: boolean;
+	/** 触发式记忆注入的单次注入条数上限 */
+	memoryInjectionTopK: number;
 	/** 是否启用 WSL fallback：在 Windows 自动检测不到 pi 时，尝试从 WSL 启动 pi */
 	wslEnabled: boolean;
 	/** WSL 发行版名称，如 Debian、Ubuntu */
@@ -1234,3 +1259,176 @@ export type FeishuTestResult = {
 
 /** 输入框发送模式，决定消息直接执行还是以只读方式触发生成计划。 */
 export type ComposerAgentMode = "normal" | "plan";
+
+/* ════════════════════════════════════════════════════════════════════
+ * Viking 记忆系统（完整版，参考 Breezell viking 架构）
+ * 三级结构 L0/L1/L2、三类 category、三档优先级 P0/P1/P2、
+ * LLM 提取+去重、关键词+优先级+时间衰减混合检索、生命周期清理。
+ * ════════════════════════════════════════════════════════════════════ */
+
+export type MemoryCategory = "memory" | "skill" | "resource";
+
+/** 任务锚状态机：进行中 → 调研完成·未确认 → 已完成（可回退/改文字） */
+export type TaskAnchorStatus = "doing" | "review" | "done";
+
+export type TaskAnchorItem = {
+	id: string;
+	text: string;
+	/** doing=进行中 / review=调研完成·未确认 / done=已完成 */
+	status: TaskAnchorStatus;
+	updatedAt: number;
+	/**
+	 * 所属会话 id（pi sessionId）。
+	 * 未设置/为空 = 全局任务，所有会话可见（用户手动添加且未绑定会话的旧数据）。
+	 * 设置后仅在该会话可见（会话级隔离，不同会话的任务互不可见）。
+	 */
+	sessionId?: string;
+};
+export type MemoryPriority = "P0" | "P1" | "P2";
+export type MemorySource = "user" | "conversation" | "auto" | "tool";
+
+export type MemoryRevision = {
+	l0: string;
+	l1: string;
+	l2: string;
+	priority: MemoryPriority;
+	tags: string[];
+	supersededAt: number;
+	sourceL2?: string;
+	sourceThreadId?: string;
+};
+
+export type MemoryMetadata = {
+	/** 何时该召回该记忆（触发场景，而非内容） */
+	retrievalAnchor?: string;
+	/** 特殊类型：trajectory=工具调用轨迹 / experience=蒸馏经验 / code-edit=代码修改 */
+	kind?: string;
+	outcome?: "success" | "recovered" | "failed";
+	updatedAt?: number;
+	/** 合并历史：保留最近 3 次被替换前的快照，防合并丢失信息 */
+	revisionHistory?: MemoryRevision[];
+	[key: string]: unknown;
+};
+
+export type MemoryNode = {
+	id: string;
+	/** memories/<id> | skills/<id> | resources/<id> */
+	path: string;
+	category: MemoryCategory;
+	/** L0 一句话摘要（<50 字） */
+	l0: string;
+	/** L1 2-5 条要点（<500 字） */
+	l1: string;
+	/** L2 全文详情 */
+	l2: string;
+	priority: MemoryPriority;
+	tags: string[];
+	parentDir: string;
+	createdAt: number;
+	lastAccessedAt: number;
+	accessCount: number;
+	/** P1/P2 有过期时间，P0 永久 */
+	expiresAt: number | null;
+	source: MemorySource;
+	threadId?: string;
+	metadata?: MemoryMetadata;
+	/** null 表示全局记忆，否则为项目根目录 */
+	workspaceId: string | null;
+};
+
+/**
+ * 一次触发式记忆注入的单条记忆摘要（供「查看注入了什么」弹窗展示）。
+ * 由主进程 buildMemoryInjection 在注入时顺手生成，随 runtime state 推给渲染进程，
+ * 避免渲染进程只能看到数量、看不到内容。
+ */
+export type MemoryInjectionEntry = {
+	/** 记忆节点 id */
+	id: string;
+	priority: MemoryPriority;
+	/** L0 一句话摘要 */
+	l0: string;
+	/** L1 要点（可能与 l0 相同或为空，UI 需去重） */
+	l1?: string;
+	/** 相对时间标注，如「3 小时前」「昨天」 */
+	timeLabel: string;
+	/** causal-case 结构（症状/根因/修复），有值时 UI 优先展示 */
+	causal?: { symptom?: string; rootCause?: string; fix?: string };
+	/** 命中词（为什么被检索到），供弹窗展示命中原因 */
+	hitTerms?: string[];
+};
+
+export type MemorySearchResult = {
+	node: MemoryNode;
+	score: number;
+	source: "local" | "embedding";
+	/** 命中的 query token（解释为什么命中，弹窗展示用） */
+	hitTerms?: string[];
+};
+
+export type MemoryStats = {
+	total: number;
+	memories: number;
+	skills: number;
+	resources: number;
+	byPriority: Record<MemoryPriority, number>;
+	/** 距过期 < 24h 的记忆数 */
+	expiringSoon: number;
+	/** 数据库文件路径（UI 展示用） */
+	dbPath: string;
+	/** 新鲜度分布（按创建/更新时间） */
+	byFreshness: { last24h: number; last7d: number; last30d: number; older: number };
+	/** 蒸馏经验数（metadata.kind === "experience"） */
+	experience: number;
+	/** 轨迹数（metadata.kind === "trajectory"） */
+	trajectories: number;
+	/** 访问频率 Top（排序后最多 5 条，含 id/l0/accessCount/expiresAt） */
+	accessTop: Array<{ id: string; l0: string; accessCount: number; expiresAt: number | null }>;
+	/** 即将过期明细（按剩余时间升序，最多 5 条） */
+	expiringSoonList: Array<{ id: string; l0: string; priority: MemoryPriority; expiresAt: number | null }>;
+};
+
+export type MemoryL0Compact = {
+	text: string;
+	memoryEntries: Array<{ id: string; l0: string; priority: MemoryPriority; effectiveAt: number }>;
+};
+
+/** 手动新增记忆的输入（面板「+ 新建」） */
+export type MemoryCreateInput = {
+	l0: string;
+	l1?: string;
+	l2?: string;
+	priority?: MemoryPriority;
+	category?: MemoryCategory;
+	tags?: string[];
+	retrievalAnchor?: string;
+	workspaceId?: string | null;
+};
+
+/**
+ * 记忆提取状态事件（主进程 → 渲染进程）。
+ * 旧版只推裸字符串阶段文本，UI 无法区分「进行中 / 完成 / 失败」，且事件后不会消失。
+ * 改为结构化事件后，面板可以明确展示四种状态（start/progress/done/error）。
+ */
+export type MemoryExtractionEvent =
+	| { type: "start"; stage: string }
+	| { type: "progress"; stage: string }
+	| { type: "done"; created: number; merged: number; skipped: number; message: string }
+	| { type: "error"; message: string };
+
+/** 从会话消息提取记忆的输入 */
+export type MemoryExtractInput = {
+	/** 会话消息数组（与 sessions:read-chat-messages 返回同构） */
+	messages: Array<{
+		role: string;
+		content?: unknown;
+		displayContent?: string;
+		name?: string;
+		type?: string;
+		params?: unknown;
+		rawParams?: unknown;
+		result?: unknown;
+		isHidden?: boolean;
+	}>;
+	threadId?: string;
+	workspaceId?: string | null;
+};

@@ -120,6 +120,9 @@ Gitmoji 对应关系：
   desktopProxyUrl: "http://127.0.0.1:7890",
   desktopProxyBypass: "localhost,127.0.0.1,::1",
   customPiPath: "",
+  // 触发式记忆注入默认开启；topK=3 保证注入量克制，不稀释模型注意力
+  memoryInjectionEnabled: true,
+  memoryInjectionTopK: 3,
   wslEnabled: false,
   wslDistro: "Ubuntu",
   wslUser: "root",
@@ -127,6 +130,10 @@ Gitmoji 对应关系：
   webServiceEnabled: false,
   webServiceHost: "0.0.0.0",
   webServicePort: 8765,
+  // DOM Agent Link 扩展目录：默认指向本地开发仓库；用户可在设置中修改（留空则禁用注入）
+  domAgentExtensionPath: "C:/kaifa/dom-agent-extension/extension",
+  // DOM Agent 控制条默认显示；关闭后注入时不再构建浮动条 UI（选择能力保留）
+  domAgentBarVisible: true,
   rpcTimeout: 600_000,
   linkOpenMode: "external",
   contentMaxWidth: 1400,

@@ -11,7 +11,8 @@ import {
 	Tray,
 } from "electron";
 import { randomUUID } from "node:crypto";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { createWriteStream, existsSync } from "node:fs";
 import { copyFile, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -27,10 +28,88 @@ import {
 	readSingleInstancePreference,
 } from "./settings/SettingsStore";
 import { acquireVersionSingleInstance } from "./singleInstance";
+import { injectDomAgent } from "./browser/domAgentInjector";
+import { MemoryService } from "./memory/memoryService";
+import { MemoryExtraction } from "./memory/memoryExtraction";
+import { EmbeddingService } from "./memory/embeddingService";
+import { buildMemoryInjection } from "./memory/memoryInjection";
+import { TaskAnchorStore } from "./memory/taskAnchorStore";
+import { enforceTaskAnchor, detectTaskIntent, summarizeTaskText } from "./memory/taskAnchorGuard";
+
+/**
+ * 解析 agent 工作目录所属的项目 workspace id：从 cwd 逐级向上找 projectStore 中登记的项目根路径
+ * （agent cwd 可能是项目子目录，如 C:\kaifa\PiDeck\src）。找不到登记项目时回退 cwd 本身
+ * （记忆库可能以 cwd 为 workspace_id 写入）。返回 null 表示无 workspace（检索全局记忆）。
+ */
+function resolveAgentWorkspaceId(cwd: string | undefined | null): string | null {
+  if (!cwd) return null;
+  let p = cwd;
+  for (;;) {
+    const proj = projectStore.findByPath(p);
+    if (proj) return proj.path;
+    const parent = dirname(p);
+    if (parent === p) break;
+    p = parent;
+  }
+  return cwd;
+}
+
+/**
+ * 解析 embedding 模型目录：按 打包资源 → 开发目录 → 用户数据 的顺序取第一个存在的。
+ * 打包后 models/ 经 extraResources 分发到 resources/models；开发时模型放在项目根 models/。
+ * 都不存在时 EmbeddingService 加载失败自动降级纯关键词检索。
+ */
+function resolveEmbeddingModelDir(): string {
+  const candidates = [
+    join(process.resourcesPath, "models"), // 打包后 extraResources → resources/models
+    join(app.getAppPath(), "resources", "models"), // 开发：项目根 resources/models
+    join(app.getPath("userData"), "models"), // 用户可自放
+  ];
+  return candidates.find((p) => existsSync(p)) ?? candidates[1];
+}
+
+/**
+ * ChatMessage[]（运行态，text/meta 结构）→ LLM 提取期望的 JSONL 消息结构。
+ * 运行态工具消息把工具名/状态/参数/结果塞在 meta 里，提取层读 content/displayContent/name/type/params/result。
+ */
+function toExtractMessages(msgs: ChatMessage[]): MemoryExtractInput["messages"] {
+	return msgs.map((m) => {
+		const meta = m.meta as Record<string, unknown> | undefined;
+		const toolStatus = meta?.status;
+		const type =
+			toolStatus === "running"
+				? "running_now"
+				: toolStatus === "error"
+					? "error"
+					: toolStatus === "done"
+						? "success"
+						: undefined;
+		let params: unknown;
+		if (meta?.args) {
+			const raw = meta.args;
+			try {
+				params = typeof raw === "string" ? JSON.parse(raw) : raw;
+			} catch {
+				params = raw;
+			}
+		}
+		return {
+			role: m.role,
+			displayContent: m.text ?? undefined,
+			isHidden: false,
+			name: typeof meta?.toolName === "string" ? meta.toolName : undefined,
+			type,
+			params,
+			result: meta?.result,
+		};
+	});
+}
 import type { StartupWindowMode } from "../shared/types";
 // 使用 ?asset 后缀导入图标，electron-vite 会在构建时将其复制到输出目录并提供正确的运行时路径
 // 这解决了打包后 build/ 目录不在 asar 中导致托盘图标丢失的问题
 import iconPath from "../../build/icon.png?asset";
+// 红色变体：开发模式（未打包，如 npm run dev）用于托盘/窗口，与绿色社区版区分
+import iconRedPath from "../../build/icon-red.png?asset";
 
 // 开发态与正式版隔离 userData。
 // 否则 npm run dev 会与已安装的 PiDeck 共用数据/锁，表现为「开发启动被复用到正式版窗口」。
@@ -131,6 +210,11 @@ import type {
 	CreatePiPromptTemplateInput,
 	CreatePiSkillInput,
 	CreateProjectSkillInput,
+	MemoryCategory,
+	MemoryCreateInput,
+	MemoryExtractInput,
+	MemoryNode,
+	ChatMessage,
 	PiPromptTemplateSummary,
 	PromptStoreSearchResult,
 	PromptStoreSearchResponse,
@@ -178,7 +262,7 @@ import {
 	validateExternalEditorCommand,
 } from "./editors/EditorDetector";
 import { FeishuBridge } from "./feishu/FeishuBridge";
-import { wantsFeishuDoc, wrapHostInstruction } from "./feishu/docActions";
+import { wantsFeishuDoc, wrapHostInstruction, stripHostInstruction } from "./feishu/docActions";
 import { resolveFeishuFileSendIntent } from "./feishu/fileIntent";
 import {
 	listBots,
@@ -197,6 +281,12 @@ let tray: Tray | null = null;
 /** 标记是否由用户主动退出（托盘菜单「退出」），区别于窗口关闭隐藏到托盘 */
 let isQuitting = false;
 let projectStore: ProjectStore;
+let memoryService: MemoryService;
+/** 自动提取轮询定时器（模块级，供 before-quit 清理） */
+let autoExtractTimer: ReturnType<typeof setInterval> | null = null;
+let memoryExtraction: MemoryExtraction;
+/** 任务锚存储：持久化 + Agent 联动（扩展工具经文件读写，主进程经 IPC） */
+let taskAnchorStore: TaskAnchorStore;
 let fileSystemService: FileSystemService;
 let sessionScanner: SessionScanner;
 let codexSessionImporter: CodexSessionImporter;
@@ -652,9 +742,11 @@ focusExistingWindow = handleVersionFocusRequest;
 
 function setupTray() {
 	// iconPath 由 electron-vite 的 ?asset 后缀自动解析，打包后也能正确定位
-	const icon = nativeImage.createFromPath(iconPath);
+	// 开发模式（app.isPackaged === false，即 npm run dev / 直接跑 out/）用红色图标，
+	// 与社区版/正式版（绿色）区分，避免桌面同时存在两个版本时分不清托盘图标。
+	const icon = nativeImage.createFromPath(app.isPackaged ? iconPath : iconRedPath);
 	tray = new Tray(icon.resize({ width: 16, height: 16 }));
-	tray.setToolTip("PiDeck");
+	tray.setToolTip(app.isPackaged ? "PiDeck" : "PiDeck（开发版）");
 
 	// 双击托盘图标恢复窗口（Windows 常见交互）
 	tray.on("double-click", () => {
@@ -807,12 +899,15 @@ async function prepareMainPreloadPath() {
 	return preparePreloadPath(sourcePath, "main-preload.js");
 }
 
+/** 主窗口 preload 路径（createWindow 时生成，供后续新建窗口复用） */
+let mainPreloadPath = "";
+
 async function createWindow() {
 	applyNativeThemeSource(settingsStore.get());
 	const windowOptions = settingsStore.createWindowOptions();
 	const showMainWindowImmediately = shouldShowMainWindowImmediately();
 	const sourcePreloadPath = join(__dirname, "../preload/index.js");
-	const mainPreloadPath = await prepareMainPreloadPath();
+	mainPreloadPath = await prepareMainPreloadPath();
 	void appLogger.info("app", "Main window preload configured", {
 		sourcePreloadPath,
 		preloadPath: mainPreloadPath,
@@ -853,7 +948,8 @@ async function createWindow() {
 		minWidth: 880,
 		minHeight: 640,
 		title: "",
-		icon: iconPath,
+		// 开发模式同样用红色窗口/任务栏图标，保持与托盘一致的可辨识度
+		icon: app.isPackaged ? iconPath : iconRedPath,
 		frame: windowOptions.frame,
 		titleBarStyle: windowOptions.titleBarStyle,
 		...(windowOptions.trafficLightPosition ? { trafficLightPosition: windowOptions.trafficLightPosition } : {}),
@@ -888,6 +984,22 @@ async function createWindow() {
 	mainWindow.webContents.setWindowOpenHandler(({ url }) => {
 		void openExternalUrl(url);
 		return { action: "deny" };
+	});
+	// 主窗口自身（PiDeck 界面）也注入 DOM Agent：允许在应用 UI 上选中元素，
+	// 选区同样上报 bridge，供 ai 生成 PiDeck 自身的样式/布局修改方案。
+	// 项目路径：dev 模式为 PiDeck 源码目录（app.getAppPath()），打包版不落码源码传空。
+	// suppressOverlay=true：隐藏批注气泡/徽章/高亮框（z-index 2147483647 会遮挡发送/停止按钮），
+	// 选区/上报逻辑仍生效，仅无视觉浮层。
+	createdWindow.webContents.on("did-finish-load", () => {
+		const pideckSource = app.isPackaged ? "" : app.getAppPath();
+		void injectDomAgent(
+			createdWindow.webContents,
+			settingsStore.get().domAgentExtensionPath,
+			pideckSource,
+			true,
+			// 设置中关闭「显示 DOM Agent 控制条」时抑制浮动条 UI（选择能力保留）
+			!settingsStore.get().domAgentBarVisible,
+		);
 	});
 	mainWindow.webContents.on("did-start-loading", () => {
 		void appLogger.info("app", "Main window load started", {
@@ -948,16 +1060,60 @@ async function createWindow() {
 				void appLogger.warn("app", "Main window preload API check failed", error);
 			});
 	});
+	/**
+	 * renderer console 错误去重限频：
+	 * 同源错误（sourceId+line+message）只写首条完整日志，后续重复只累计计数，
+	 * 每 60s 把窗口内被抑制的重复错误合并成一条汇总。
+	 * 防止 HMR 状态错乱 / WebView 崩溃等场景产生的每秒几十条重复错误洪流打爆磁盘 IO
+	 * （曾把 pi 子进程启动拖慢到 40s+，见 get_state 超时重试日志）。
+	 */
+	const consoleErrorStats = new Map<string, { count: number }>();
+	let consoleErrorFlushTimer: NodeJS.Timeout | null = null;
+	let lastConsoleErrorFullLogAt = 0;
+	const CONSOLE_ERROR_MIN_LOG_INTERVAL_MS = 500;
+
+	const flushConsoleErrorSummary = () => {
+		if (consoleErrorStats.size === 0) return;
+		const total = [...consoleErrorStats.values()].reduce((sum, v) => sum + v.count, 0);
+		const distinct = consoleErrorStats.size;
+		consoleErrorStats.clear();
+		void appLogger.warn("app", "Main window renderer console error summary", {
+			suppressedCount: total,
+			distinctErrors: distinct,
+		});
+	};
+
 	mainWindow.webContents.on(
 		"console-message",
 		(event) => {
 			if (!["warning", "error"].includes(event.level)) return;
-			void appLogger.warn("app", "Main window renderer console error", {
-				level: event.level,
-				message: event.message,
-				line: event.lineNumber,
-				sourceId: event.sourceId,
-			});
+			const key = `${event.level}|${event.sourceId ?? ""}|${event.lineNumber ?? 0}|${event.message}`;
+			const existing = consoleErrorStats.get(key);
+			if (existing) {
+				existing.count++;
+				// 错误种类极多时防内存无限增长：超限立即汇总结算并清空。
+				if (consoleErrorStats.size >= 500) flushConsoleErrorSummary();
+				return;
+			}
+			consoleErrorStats.set(key, { count: 1 });
+			// 全局限速：即使错误种类本身很多（如 React 警告），完整日志也至少间隔 500ms 一条。
+			const now = Date.now();
+			if (now - lastConsoleErrorFullLogAt >= CONSOLE_ERROR_MIN_LOG_INTERVAL_MS) {
+				lastConsoleErrorFullLogAt = now;
+				void appLogger.warn("app", "Main window renderer console error", {
+					level: event.level,
+					message: event.message,
+					line: event.lineNumber,
+					sourceId: event.sourceId,
+				});
+			}
+			// 启动周期汇总定时器（单例）：60s 后把被抑制的重复错误合并成一条。
+			if (!consoleErrorFlushTimer) {
+				consoleErrorFlushTimer = setTimeout(() => {
+					consoleErrorFlushTimer = null;
+					flushConsoleErrorSummary();
+				}, 60_000);
+			}
 		},
 	);
 
@@ -983,6 +1139,15 @@ async function createWindow() {
 	// 监听浏览器标准快捷键打开开发者工具
 	mainWindow.webContents.on("before-input-event", (event, input) => {
 		if (!mainWindow || mainWindow.isDestroyed()) return;
+
+		// Ctrl+Shift+D：切换主窗口 DOM Agent 浮层可见性（默认隐藏避免遮挡按钮；需要选元素时激活）
+		if (input.key.toLowerCase() === "d" && input.control && input.shift && input.type === "keyDown") {
+			event.preventDefault();
+			void mainWindow.webContents
+				.executeJavaScript("window.__domlinkToggleOverlay ? window.__domlinkToggleOverlay() : true", true)
+				.catch(() => undefined);
+			void appLogger.info("agent", "DOM Agent overlay toggled (Ctrl+Shift+D)");
+		}
 
 		// F12
 		if (input.key === "F12" && input.type === "keyDown") {
@@ -1575,6 +1740,52 @@ function registerIpc() {
 	ipcMain.handle(ipcChannels.browserOpenExternal, async (_event, url: string) => {
 		// shell.openExternal 使用系统默认浏览器打开链接，可控且安全。
 		await shell.openExternal(url);
+	});
+
+	// 弹出独立浏览器窗口：宽度不受右侧抽屉限制，适合需要看完整页面布局的场景。
+	// 窗口加载渲染进程入口并以 ?floating=browser 标记，渲染端只渲染全宽浏览器面板。
+	ipcMain.handle(ipcChannels.browserOpenWindow, async (_event, initialUrl: string) => {
+		const floatWin = new BrowserWindow({
+			width: 1280,
+			height: 820,
+			minWidth: 900,
+			minHeight: 620,
+			title: "PiDeck Browser",
+			autoHideMenuBar: true,
+			webPreferences: {
+				preload: mainPreloadPath,
+				sandbox: electronChromiumSandboxEnabled,
+				contextIsolation: true,
+				nodeIntegration: false,
+				webviewTag: true,
+			},
+		});
+		const devRendererUrl = process.env.ELECTRON_RENDERER_URL;
+		if (devRendererUrl) {
+			const u = new URL(devRendererUrl);
+			u.searchParams.set("floating", "browser");
+			if (initialUrl) u.searchParams.set("url", initialUrl);
+			void floatWin.loadURL(u.toString());
+		} else {
+			void floatWin.loadFile(join(__dirname, "../renderer/index.html"), {
+				query: { floating: "browser", url: initialUrl ?? "" },
+			});
+		}
+	});
+
+	// 独立浏览器窗口选中 DOM 元素 → 转发给主窗口（填入聊天输入框）
+	ipcMain.on(ipcChannels.browserLightSelect, (_event, info) => {
+		if (mainWindow && !mainWindow.isDestroyed()) {
+			mainWindow.webContents.send(ipcChannels.browserLightSelect, info);
+		}
+	});
+
+	// webview guest preload 路径（错误捕获在页面最早阶段注入；dev 指向源码 resources，打包指向 extraResources）
+	ipcMain.handle(ipcChannels.browserGetGuestPreloadPath, () => {
+		const p = app.isPackaged
+			? join(process.resourcesPath, "browser-guest-preload.js")
+			: join(app.getAppPath(), "resources", "browser-guest-preload.js");
+		return pathToFileURL(p).toString();
 	});
 
 	ipcMain.handle(ipcChannels.filesReadContent, async (_event, path: string) => {
@@ -2804,6 +3015,19 @@ function registerIpc() {
 			if ("useNativeTitleBar" in patch) {
 				settingsStore.notifyTitleBarChange(mainWindow);
 			}
+			if ("domAgentBarVisible" in patch) {
+				// 立即同步已注入主窗口的 DOM Agent 控制条：开关变化无需刷新窗口，
+				// 直接调用 shim 暴露的接口切换显隐；注入时开关为关（bar 未构建）则接口
+				// 不存在，静默跳过，重新开启后需刷新窗口才会重建控制条。
+				if (mainWindow && !mainWindow.isDestroyed()) {
+					void mainWindow.webContents
+						.executeJavaScript(
+							`window.__domlinkSetBarVisible ? window.__domlinkSetBarVisible(${settings.domAgentBarVisible}) : true`,
+							true,
+						)
+						.catch(() => undefined);
+				}
+			}
 			if ("zoomFactor" in patch) {
 				mainWindow?.webContents.setZoomFactor(settings.zoomFactor);
 			}
@@ -3336,8 +3560,44 @@ function registerIpc() {
 	);
 	ipcMain.handle(ipcChannels.agentsStop, async (_event, agentId: string) => {
 		terminalManager.closeAgent(agentId);
+		// 在 stop 销毁 agent 前拿到消息与 sessionId，供异步沉淀记忆
+		const tab = agentManager.list().find((t) => t.id === agentId);
+		const messages = agentManager.getMessages(agentId);
 		await agentManager.stop(agentId);
 		void appLogger.info("agent", "Agent stopped", { agentId });
+		// Viking 记忆提取：会话关闭后异步把讨论沉淀为记忆节点（thread_id 关联会话），
+		// 供后续任何会话通过 pi-deck-memory 的 search_memory 跨会话召回。
+		// 仅当消息数足够且有 sessionId 时触发；失败静默不影响关闭流程。
+		// 净化原则：记忆只沉淀“agent 讨论出的问题/结论/经验”——
+		// user/assistant 全量进提取；tool 只传元信息（工具名 + 命令/路径参数），
+		// 不传工具输出原文（脏数据），减少 LLM 提取的 token 消耗并避免噪音污染记忆。
+		if (tab && messages.length >= 8) {
+			const workspaceId = projectStore.list().find((p) => p.kind !== "chat")?.path ?? null;
+			void memoryExtraction
+				.analyzeAndSave({
+					messages: messages.map((m) => {
+						if (m.role === "tool") {
+							const meta = m.meta as Record<string, unknown> | undefined;
+							return {
+								role: m.role,
+								content: m.text,
+								// 让 memoryExtraction 的 toolBrief 提取“做了什么”（工具名+命令/路径）
+								name: typeof meta?.toolName === "string" ? meta.toolName : undefined,
+								params: meta?.args,
+							};
+						}
+						return { role: m.role, content: m.text };
+					}),
+					threadId: tab.sessionId ?? undefined,
+					workspaceId,
+				})
+				.catch((error) => {
+					void appLogger.warn("memory", "Agent stop memory extraction failed", {
+						agentId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
+		}
 	});
 	ipcMain.handle(ipcChannels.agentsPrompt, async (_event, input: SendPromptInput) => {
 		const bridge = feishuBridge;
@@ -3346,6 +3606,79 @@ function registerIpc() {
 		const docTitle = bridgeConnected ? wantsFeishuDoc(input.message) : undefined;
 		const sessionChatId = bridgeConnected ? bridge.getSessionChatId(input.agentId) : undefined;
 		let agentInstruction: string | undefined;
+		// 任务锚注入（用户消息发送 hook）：每轮把当前任务锚 + 维护规则作为宿主指令注入，
+		// 让 agent 感知任务列表并主动维护（add/update）。规则明确"只登记跨轮主任务"，
+		// 避免单轮问答/闲聊污染任务锚（用户约束：主任务不要什么都往里面塞）。
+		// 会话级隔离：只注入「当前会话的任务 + 全局任务」，切换会话后各看各的。
+		const anchorAll = taskAnchorStore?.load() ?? [];
+		const currentSid = agentManager.list().find((t) => t.id === input.agentId)?.sessionId;
+		const anchorTasks = currentSid
+			? anchorAll.filter((t) => !t.sessionId || t.sessionId === currentSid)
+			: // 会话未启动（sessionId 来自 pi get_state，Agent 启动后才返回）：
+			// 仅注入全局任务，避免宿主指令携带一堆无关的历史会话任务。
+			anchorAll.filter((t) => !t.sessionId);
+		const anchorLines =
+			anchorTasks.length > 0
+				? anchorTasks.map((t, i) => `${i + 1}. [${t.status}]${t.sessionId ? "" : "[全局]"} ${t.text}`).join("\n")
+				: "（当前无任务）";
+		const anchorInstruction = [
+			"【当前任务锚】PiDeck 输入框上方可见的核心任务列表：",
+			anchorLines,
+			"",
+			"维护规则（强制）：用户消息明确提出需跨轮跟踪的主任务（修复/实现/调研/优化/重构/排查/处理等）时，必须立即用 task_anchor add 登记（doing），严禁跳过登记；",
+			"单轮问答、闲聊、临时指令不登记；add 前先 task_anchor list 去重；任务推进时 update 为 review/done 并补充结论。",
+			"会话结束时主进程会强校验：存在任务型请求但未登记，将自动补登记并强提示——但不要依赖兜底，应主动登记。",
+			// 主进程侧任务意图检测（不依赖 pi 侧 input 事件，双保险）：本轮用户消息命中任务型请求时，
+			// 直接在宿主指令中强制要求登记，agent 在系统提示层面就能看到「必须登记」。
+			...(detectTaskIntent(input.message)
+				? [`⚠️ 本轮对话检测到任务型请求：「${summarizeTaskText(input.message)}」——必须在回复前用 task_anchor add 登记该任务（doing）。`]
+				: []),
+		].join("\n");
+		agentInstruction = agentInstruction ? `${anchorInstruction}\n\n${agentInstruction}` : anchorInstruction;
+
+		// 触发式记忆注入：把“要召回什么”变成主进程例行程序，而不是依赖 LLM 自觉调用检索工具。
+		// 检索 query = 当前消息 + 会话最近几条消息（解决“继续”“然后呢”等短消息单独检索召回率低的问题）。
+		// 宿主指令包裹体由展示层剥离，UI 气泡只显示用户原文；pi 完整接收。
+		const memorySettings = settingsStore.get();
+		if (memorySettings.memoryInjectionEnabled && !input.message.trim().startsWith("!")) {
+			try {
+				const recent = agentManager.getMessages(input.agentId).slice(-4);
+				const recentTexts = recent
+					.filter((m) => m.role === "user" || m.role === "assistant")
+					.map((m) => stripHostInstruction(m.text ?? ""))
+					.map((s) => s.trim())
+					.filter((s) => s.length > 0 && !s.startsWith("[图片]"))
+					.slice(-3);
+				// 修复 E：queryTexts[0]（当前消息）也必须剥离宿主指令——此前只用 stripHostInstruction 处理
+				// recent 消息，当前消息带着 [PIDECK_HOST_INSTRUCTION]（任务锚全文）进 query，
+				// 短用户消息（如「面板 打开 转圈」）的意图词被任务锚文本稀释，覆盖率过低过不了
+				// minScore → 触发式注入 0 条（实测问题 2/3 会话即此根因，问题 4 因 mysql/innodb
+				// 强特异性词幸存）。
+				const queryTexts = [stripHostInstruction(input.message), ...recentTexts.filter((s) => s !== input.message)];
+				// 修复 A：workspace 取当前会话 agent 的项目（而非 projectStore 第一个非 chat 项目）。
+				// 旧逻辑在 pideck 会话里会检索 web-tracing-docs 的记忆——注入内容与正在做的事完全错位；
+				// 现在按 agent cwd 向上找所属项目根路径（cwd 可能是子目录），找不到则回退 cwd 本身。
+				const agentCwd = agentManager.getCwd(input.agentId);
+				const memWorkspaceId = resolveAgentWorkspaceId(agentCwd);
+				const { block: memoryCtx, count: memoryInjectedCount, entries: memoryInjectedEntries } = await buildMemoryInjection({
+					memory: memoryService,
+					workspaceId: memWorkspaceId,
+					queryTexts,
+					topK: memorySettings.memoryInjectionTopK,
+				});
+				if (memoryCtx) {
+					agentInstruction = agentInstruction ? `${agentInstruction}\n\n${memoryCtx}` : memoryCtx;
+					// 命中计数 + 注入详情：计数推送到运行时状态（顶部状态栏显示“记忆注入 N 条”），
+					// 详情供弹窗查看本次具体注入了哪些记忆（与注入文本同源，无需二次检索）
+					agentManager.recordMemoryInjection(input.agentId, memoryInjectedCount, memoryInjectedEntries);
+				}
+			} catch (error) {
+				void appLogger.warn("memory", "Memory injection failed", {
+					agentId: input.agentId,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		const buildFeishuActionInstruction = (chatId?: string) => [
 			"当前会话已连接飞书聊天。严禁调用 lark-cli、飞书 IM API 或搜索群聊来发送文件；不要询问 chat_id。需要把本地文件发到当前飞书聊天时，最终回答末尾独立一行写 [SEND_FILE:本地文件路径]，PiDeck 会按当前会话绑定自动上传。",
 			chatId ? `当前绑定的飞书 chat_id: ${chatId}。这是只读上下文，用于确认当前会话绑定；发送文件仍必须用 [SEND_FILE:本地文件路径]。` : undefined,
@@ -3727,6 +4060,78 @@ function sendTelemetryHeartbeat() {
 	});
 
 	void telemetry.sendHeartbeat().catch(() => undefined);
+
+	// ── Viking 记忆系统 IPC ──────────────────────────────────
+	const currentWorkspace = (): string | null => {
+		const project = projectStore.list().find((p) => p.kind !== "chat");
+		return project?.path ?? null;
+	};
+	ipcMain.handle(ipcChannels.memoryList, (_e, opts?: { scope?: "all" | "global" | "workspace"; category?: string }) => {
+		return memoryService.list(opts?.scope ?? "all", currentWorkspace(), (opts?.category as MemoryCategory) ?? undefined);
+	});
+	ipcMain.handle(ipcChannels.memoryGet, (_e, id: string) => memoryService.getNode(id));
+	ipcMain.handle(ipcChannels.memoryAdd, async (_e, input: MemoryCreateInput) => {
+		const node = await memoryService.createFromInput(input, currentWorkspace());
+		return node;
+	});
+	ipcMain.handle(ipcChannels.memoryUpdate, (_e, id: string, patch: Partial<MemoryNode>) => {
+		return memoryService.updateNode(id, patch);
+	});
+	ipcMain.handle(ipcChannels.memoryRemove, (_e, id: string) => memoryService.removeNode(id));
+	ipcMain.handle(ipcChannels.memorySearch, (_e, query: string, opts?: { scope?: "all" | "global" | "workspace"; category?: string; topK?: number }) => {
+		return memoryService.search(query, {
+			scope: opts?.scope ?? "all",
+			workspaceId: opts?.scope === "global" ? null : currentWorkspace(),
+			category: (opts?.category as MemoryCategory) ?? undefined,
+			topK: opts?.topK ?? 10,
+		});
+	});
+	ipcMain.handle(ipcChannels.memoryExtract, async (_e, input: MemoryExtractInput) => {
+		// 手动提取 = 经验蒸馏 + 对话记忆提取（完整 Viking 流程）
+		// 面板传入的是 ChatMessage[]（text/meta 结构），需先转换成提取期望的消息结构
+		const normalized = Array.isArray(input.messages)
+			? { ...input, messages: toExtractMessages(input.messages as ChatMessage[]) }
+			: input;
+		const merged = { ...normalized, workspaceId: normalized.workspaceId ?? currentWorkspace() };
+		const trajResult = await memoryExtraction.captureTrajectoryAndDistill(merged).catch(() => ({ trajectoryId: null, experienceId: null }));
+		const result = await memoryExtraction.analyzeAndSave(merged);
+		if (result.status === "saved" || trajResult.experienceId) {
+			return {
+				...result,
+				status: "saved",
+				message: `${result.message ?? ""}${trajResult.experienceId ? "；经验蒸馏成功" : ""}`,
+			};
+		}
+		return result;
+	});
+	ipcMain.handle(ipcChannels.memoryPin, (_e, id: string, pinned: boolean) => memoryService.pin(id, pinned));
+	ipcMain.handle(ipcChannels.memoryStats, () => memoryService.getStats(currentWorkspace()));
+	ipcMain.handle(ipcChannels.memoryL0Index, (_e, opts?: { budget?: number; includeResources?: boolean }) => {
+		return memoryService.getL0Compact(currentWorkspace(), opts?.budget ?? 3200, opts?.includeResources ?? true);
+	});
+	ipcMain.handle(ipcChannels.memoryLifecycle, () => memoryService.runLifecycle());
+
+	// ── Task Anchor（任务锚）IPC：持久化 + Agent 联动 ──
+	// 任务锚由 renderer（用户输入）与 pi 扩展工具（Agent 更新）共同读写同一份文件；
+	// 主进程统一收口，变更后向 renderer 推送 taskAnchorChanged 事件实现实时刷新。
+	ipcMain.handle(ipcChannels.taskAnchorLoad, () => taskAnchorStore.load());
+	ipcMain.handle(
+		ipcChannels.taskAnchorSave,
+		(_e, tasks: import("../shared/types").TaskAnchorItem[]) => {
+			const saved = taskAnchorStore.save(tasks);
+			notifyTaskAnchorChanged();
+			return saved;
+		},
+	);
+	/** Agent 工具更新（经扩展写文件后主进程轮询/事件）时推送给 renderer */
+	ipcMain.on(ipcChannels.taskAnchorChanged, () => notifyTaskAnchorChanged());
+}
+
+/** 向 renderer 推送任务锚变化事件（扩展写文件 / 用户保存后刷新 UI） */
+function notifyTaskAnchorChanged() {
+	if (mainWindow && !mainWindow.isDestroyed()) {
+		mainWindow.webContents.send(ipcChannels.taskAnchorChanged);
+	}
 }
 
 async function detectExternalEditorsOnFirstLaunch() {
@@ -3791,6 +4196,43 @@ app.whenReady().then(async () => {
 	worktreeService = new WorktreeService();
 	piLocator = new PiLocator();
 	configManager = new ConfigManager();
+	// Viking 记忆系统：SQLite 存储 + LLM 提取（完整版，见 main/memory/）
+	memoryService = new MemoryService(join(app.getPath("userData"), "viking.db"));
+	// 语义检索：本地 embedding（all-MiniLM-L6-v2），模型目录按打包/开发环境解析；
+	// 加载失败自动降级纯关键词，不影响注入链路。预热 fire-and-forget：模型加载 + 全库补向量。
+	const embeddingService = new EmbeddingService(
+		memoryService.db,
+		resolveEmbeddingModelDir(),
+		// 日志进 AppLogger 文件（console 不写 app-*.log，用户看不到）；scope 用 memory 便于过滤
+		{ info: (msg) => appLogger.info("memory", msg), warn: (msg) => appLogger.warn("memory", msg) },
+	);
+	memoryService.semantic = embeddingService;
+	// 预热：启动后后台加载模型并为无向量节点补向量；预热完成前检索走纯 BM25（query 向量缓存命中后语义生效）
+	void embeddingService
+		.preload(
+			memoryService
+				.list("all", null)
+				.map((n) => ({ id: n.id, text: `${n.l0}\n${n.l1}` })),
+		)
+		.catch(() => {
+			/* 模型不可用：降级纯关键词检索，静默 */
+		});
+	memoryExtraction = new MemoryExtraction(configManager, memoryService, (ev) => {
+		mainWindow?.webContents.send(ipcChannels.memoryExtractionEvent, ev);
+	});
+	// 任务锚：持久化 + 监听文件变化（Agent 扩展写文件 → 推送 renderer 刷新）
+	taskAnchorStore = new TaskAnchorStore();
+	taskAnchorStore.watch(() => {
+		if (mainWindow && !mainWindow.isDestroyed()) {
+			mainWindow.webContents.send(ipcChannels.taskAnchorChanged);
+		}
+	});
+	// 记忆变化实时推送到右侧面板（memory:changed）
+	memoryService.onDidChange(() => {
+		if (mainWindow && !mainWindow.isDestroyed()) {
+			mainWindow.webContents.send(ipcChannels.memoryChanged);
+		}
+	});
 	promptManager = new PromptManager();
 	xuePromptManager = new XuePromptManager();
 	skillManager = new SkillManager();
@@ -3808,7 +4250,107 @@ app.whenReady().then(async () => {
 		configManager,
 		rpcLogger,
 		appLogger,
+		// 任务锚强校验守卫：agent 正常结束（agent_settled）时，
+		// ① 本轮含任务型请求但任务锚无登记 → 强制补登记 + 强提示（warning toast）。
+		// 不依赖 agent 调用 task_anchor 工具——主进程兜底，杜绝“任务漏登记”漏洞。
+		// 【2026-08 修复】不再自动推进 doing→review：agent_settled ≠ 任务完成
+		//（后台异步 subagent 运行时或 agent 仅汇报中间进度时会误标），
+		// 状态流转（doing→review→done）由 agent 显式调用 task_anchor 维护。
+		(agentId) => {
+			const tab = agentManager.list().find((t) => t.id === agentId);
+			const sid = tab?.sessionId;
+			// 最近的 user 消息（剔除宿主指令体），用于任务意图检测
+			const msgs = agentManager.getMessages(agentId);
+			const userTexts = msgs
+				.filter((m) => m.role === "user" && !m.text.includes("PIDECK_HOST_INSTRUCTION"))
+				.slice(-3)
+				.map((m) => m.text);
+			enforceTaskAnchor({
+				recentUserTexts: userTexts,
+				sessionId: sid,
+				load: () => taskAnchorStore.load(),
+				save: (tasks) => taskAnchorStore.save(tasks),
+				update: (id, patch) => taskAnchorStore.update(id, patch),
+				// 强提示：主进程直接推 warning toast（长驻 8s），不依赖 renderer 侧主动检查
+				notify: (message) => {
+					mainWindow?.webContents.send(ipcChannels.agentsNotice, {
+						agentId,
+						message,
+						kind: "warning",
+						duration: 8000,
+					});
+				},
+				log: (scope, message, detail) => void appLogger.info(scope, message, detail),
+			});
+			notifyTaskAnchorChanged();
+		},
 	);
+	// ── 会话结束自动提取记忆（低频轮询版） ────────────────
+	// 用户反馈：agent_settled 即时提取调用太频繁（每个会话结束都跑）。改为定时轮询：
+	//   - 每 1 小时检查一次（setInterval + 启动立即跑一轮）
+	//   - 只提取「最后更新 ≥ 1 小时前 且 从未提取过」的会话 —— 活跃会话自动等待稳定
+	//   - 每轮最多处理 3 个会话，避免一次刷爆 LLM 调用
+	//   - 提取后写入 viking.db extracted_sessions 表标记，每个会话只提取一次
+	// 历史会话 readMessages 只返回 user/assistant（无 tool 消息），轨迹蒸馏不可用，
+	// 因此只走对话记忆/教训提取（analyzeAndSave）；手动「提取」按钮仍走完整流程。
+	const AUTO_EXTRACT_INTERVAL_MS = 60 * 60 * 1000; // 检查周期：1 小时
+	const AUTO_EXTRACT_IDLE_MS = 60 * 60 * 1000; // 会话需停止更新 1 小时后才可提取
+	const AUTO_EXTRACT_MAX_PER_ROUND = 3; // 每轮最多处理会话数（防 LLM 风暴）
+	autoExtractTimer = setInterval(() => {
+		void runAutoExtract();
+	}, AUTO_EXTRACT_INTERVAL_MS);
+	async function runAutoExtract(): Promise<void> {
+		try {
+			const now = Date.now();
+			const sessions = await sessionScanner.list();
+			const candidates = sessions
+				// 只提取 pi 原生会话（跳过 codex/claude/opencode 导入）
+				.filter((s) => !s.source || s.source === "pi")
+				// 子会话嵌套在父会话中，不单独提取
+				.filter((s) => !s.parentSessionPath)
+				// 最后更新 ≥ 1 小时前（会话已稳定；一直在更新的会话等待满 1 小时）
+				.filter((s) => s.updatedAt <= now - AUTO_EXTRACT_IDLE_MS)
+				// 从未提取过（每个会话只扫描一次）
+				.filter((s) => !memoryService.isSessionExtracted(s.filePath))
+				// 最近结束的优先
+				.sort((a, b) => b.updatedAt - a.updatedAt)
+				.slice(0, AUTO_EXTRACT_MAX_PER_ROUND);
+			if (candidates.length === 0) return;
+			void appLogger?.info("memory", "Auto extract round", {
+				count: candidates.length,
+				sessions: candidates.map((s) => s.filePath),
+			});
+			for (const session of candidates) {
+				try {
+					const msgs = await sessionScanner.readMessages(session.filePath);
+					if (msgs.length < 4) {
+						// 过短会话不值得提取，同样标记避免下轮反复重扫
+						memoryService.markSessionExtracted(session.filePath);
+						continue;
+					}
+					const extractInput: MemoryExtractInput = {
+						messages: msgs.map((m) => ({ role: m.role, displayContent: m.content })),
+						threadId: session.filePath,
+						workspaceId: session.projectPath ?? null,
+					};
+					await memoryExtraction.analyzeAndSave(extractInput);
+					memoryService.markSessionExtracted(session.filePath);
+				} catch (err) {
+					// 单会话失败不标记，下一轮重试；记录日志便于排查
+					void appLogger?.error("memory", "Auto extract session failed", {
+						session: session.filePath,
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+			}
+		} catch (err) {
+			void appLogger?.error("memory", "Auto extract round failed", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	// 启动即跑一轮：消化已稳定（1 小时前结束）的历史会话
+	void runAutoExtract();
 	webServiceManager = new WebServiceManager({
 		listProjects: () => projectStore.list(),
 		listAgents: () => agentManager.list(),
@@ -3846,6 +4388,12 @@ app.whenReady().then(async () => {
 	await settingsStore.load();
 	registerIpc();
 	registerFeishuIpc();
+	// 预热 pi RPC 运行时（不阻塞窗口）：冷启动需 jiti 编译扩展 + 包扫描，可达 30s+；
+	// 提前在后台跑一轮完整初始化，用户创建首个 Agent 时命中缓存，从 30s+ 降到 2-3s。
+	// 放在 createWindow 之前启动，确保窗口可用时预热已基本完成。
+	void warmUpPiRuntime().catch((error) => {
+		console.warn("[PiDeck] Failed to warm up pi runtime:", error);
+	});
 	await createWindow();
 	setupTray();
 
@@ -3864,6 +4412,50 @@ app.whenReady().then(async () => {
 		}
 	});
 });
+
+/**
+ * 预热 pi RPC 运行时，让首个 Agent 会话快速可用。
+ *
+ * 背景：pi 冷启动需要 jiti 运行时编译全部 TS 扩展（18 个）+ 扫描 npm 包目录（~153MB），
+ * 实测首次启动 7s~31s（重启 dev 后受 electron-vite 重建 out/、旧实例多进程退出清理、
+ * 杀软首扫等磁盘 IO 竞争放大），期间 pi 不读 stdin、不响应任何 RPC，导致用户点创建后的
+ * 第一个会话长时间停留在 starting 状态。而第二次启动因 jiti 编译缓存 + OS 文件缓存命中，
+ * 只需 2-3s。
+ *
+ * 策略：在应用启动后台阶段先拉起一个临时 pi 进程（--no-session），等它完成一轮完整初始化
+ * （即 get_state 就绪）后立即退出。这样扩展编译缓存、包扫描缓存、杀软扫描结果全部预热完成，
+ * 用户创建第一个真实 Agent 时命中缓存，冷启动成本从 30s+ 降到 2-3s。
+ *
+ * 失败静默：预热失败不阻塞主流程，最多是第一个 Agent 回到原来的慢启动体验。
+ */
+async function warmUpPiRuntime(): Promise<void> {
+	const t0 = Date.now();
+	const settings = settingsStore.get();
+	// 预热进程不绑定具体项目：扩展/包扫描都在用户 home 的 ~/.pi 下，与 cwd 无关。
+	// 用 home 作 cwd 避免触发项目级 trust 确认（trust 弹窗不应在后台出现）。
+	const warmup = new PiProcess(
+		app.getPath("home"),
+		settings,
+		undefined,
+		{ agentHomeDir: activeWslEnvironment?.windowsHome },
+	);
+	// start 内部 spawn 失败（pi 未安装等）会同步抛错；挂一个 error sink 防 EventEmitter 裸 error。
+	warmup.on("error", () => {
+		/* 静默：start 的 try/catch 已覆盖诊断 */
+	});
+	try {
+		const client = await warmup.start(undefined, undefined, true /* noSession */);
+		// get_state 就绪 = 扩展编译与包扫描完成；此后再退出，缓存已写盘。
+		// 超时 60s 兜底：预热进程长期未就绪（如杀软全盘扫描）时放弃，避免后台僵尸进程。
+		await client.request({ type: "get_state" }, 60_000);
+		const elapsed = Date.now() - t0;
+		void appLogger?.info("pi", "Pi runtime warm-up completed", { warmUpMs: elapsed });
+	} finally {
+		// 无论成功失败都退出预热进程：它只是缓存预热器，不承载业务会话。
+		// stop() 内部会等待 exit 事件并还原临时停放的扩展。
+		warmup.stop();
+	}
+}
 
 /**
  * 窗口出现后的后台启动任务。
@@ -4215,6 +4807,7 @@ async function ensureAllPiSettingsDefaults(): Promise<void> {
 
 app.on("before-quit", () => {
 	isQuitting = true;
+	if (autoExtractTimer) clearInterval(autoExtractTimer);
 	tray?.destroy();
 	tray = null;
 	void webServiceManager?.stop();
