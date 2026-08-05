@@ -15,7 +15,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createWriteStream, existsSync } from "node:fs";
 import { copyFile, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { is } from "@electron-toolkit/utils";
 import { PetSystem, type PetSystemDeps } from "./pet";
 import {
@@ -841,6 +841,27 @@ function openInternalLinkInBrowserPanel(url: string) {
 	mainWindow.webContents.send(ipcChannels.appOpenInBrowser, url);
 }
 
+/**
+ * 解析系统 Node 版本（pi 进程运行的运行时）。
+ * node:sqlite 自 Node 22.13 起默认内置（22.5-22.12 需 --experimental-sqlite）——
+ * PiDeck 记忆扩展（pi-deck-memory*.ts）依赖它，低于该版本时扩展降级（记忆工具不可用）。
+ * 返回 null 表示检测不到系统 node（可能不在 PATH）。
+ */
+function detectSystemNodeVersion(): { version: string; ok: boolean } {
+  try {
+    const res = spawnSync("node", ["--version"], { encoding: "utf8", timeout: 5000, windowsHide: true });
+    if (res.status !== 0 || !res.stdout) return { version: "unknown", ok: false };
+    const raw = res.stdout.trim(); // 形如 v22.22.1
+    const ver = raw.replace(/^v/, "");
+    const parts = ver.split(".").map(Number);
+    // node:sqlite 默认可用需 Node ≥ 22.13（major.minor 比较；23+ 恒 OK）
+    const ok = parts.length >= 2 && (parts[0] > 22 || (parts[0] === 22 && parts[1] >= 13) || parts[0] >= 23);
+    return { version: ver, ok };
+  } catch {
+    return { version: "unknown", ok: false };
+  }
+}
+
 function printStartupInfo() {
 	if (!mainWindow || mainWindow.isDestroyed()) return;
 
@@ -856,6 +877,14 @@ function printStartupInfo() {
 	// Debug 中展示实际生效类型,便于发现持久化值和运行时便携信号不一致的问题。
 	const effectiveInstallationType =
 		process.platform === "win32" && isPortableEnv ? "portable" : persistentInstallationType;
+	// 系统 Node 自检（pi 扩展运行环境）：node:sqlite 需 Node ≥ 22.13，低于则记忆扩展降级
+	const sysNode = detectSystemNodeVersion();
+	const sysNodeVersion = sysNode.version;
+	const sysNodeOk = sysNode.ok;
+	const sysNodeColor = sysNodeOk ? "#10b981" : "#ef4444";
+	const sysNodeOkMark = sysNodeOk
+		? "✅"
+		: "⚠️ < 22.13：记忆扩展降级（search_memory/search_sessions 不可用，建议升级 Node ≥ 22.13）";
 
 	// 执行 console.log 输出到开发者工具
 	mainWindow.webContents.executeJavaScript(`
@@ -881,6 +910,19 @@ function printStartupInfo() {
 		console.log("%c  Electron:        %c${electronVersion}", "color: #6b7280;", "color: #06b6d4;");
 		console.log("%c  Chrome:          %c${chromeVersion}", "color: #6b7280;", "color: #06b6d4;");
 		console.log("%c  Node:            %c${nodeVersion}", "color: #6b7280;", "color: #06b6d4;");
+		// 系统 Node 自检：pi 进程（记忆扩展）跑在系统 Node 上，node:sqlite 需 ≥ 22.13；
+		// 主进程是 Electron 内置 Node（恒 OK），但扩展会降级——启动时明示，避免用户疑惑。
+		// sysNode 在主进程提前计算，这里只做模板插值。
+		console.log(
+			"%c  System Node:    %c${sysNode.version} ${sysNodeOkMark}",
+			"color: #6b7280;",
+			"color: ${sysNodeColor};",
+		);
+		if (!sysNodeOk) {
+			void appLogger.warn("self-check", "系统 Node 版本不支持 node:sqlite，PiDeck 记忆扩展将降级（需 Node ≥ 22.13）", {
+				version: sysNodeVersion,
+			});
+		}
 		console.log("");
 		console.log("%c🔧 Debug Info", "color: #3b82f6; font-weight: bold; font-size: 14px;");
 		console.log("%c  PORTABLE_EXECUTABLE_DIR: %c${isPortableEnv ? '✅ Set' : '❌ Not set'}", "color: #6b7280;", "color: ${isPortableEnv ? '#10b981' : '#ef4444'};");
