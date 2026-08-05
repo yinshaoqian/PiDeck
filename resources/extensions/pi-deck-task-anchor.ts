@@ -113,7 +113,7 @@ export default function (pi: ExtensionAPI) {
 			"用户确认后 update 为 done。改动会实时同步到桌面 UI（主进程监听文件变化）。" +
 			"action 说明：list=查看全部；add=新增任务；update=按 id 更新文字/状态；complete=快捷标已完成。",
 		parameters: Type.Object({
-			action: StringEnum(["list", "add", "update", "complete"], { description: "操作类型" }),
+			action: StringEnum(["list", "add", "update", "complete", "remove"], { description: "操作类型" }),
 			text: Type.Optional(Type.String({ description: "add/update 时的任务文字" })),
 			id: Type.Optional(Type.String({ description: "update/complete 时的任务 id" })),
 			status: Type.Optional(
@@ -221,6 +221,28 @@ export default function (pi: ExtensionAPI) {
 					return {
 						content: [{ type: "text", text: `任务 #${args.id} 已标记完成 ✅。` }],
 						details: { ok: true, total: next.length },
+					};
+				}
+				case "remove": {
+					// 删除任务（清理过时/重复登记）：按 id 移除，避免任务锚被历史任务塞满
+					if (!args.id) {
+						return {
+							content: [{ type: "text", text: "remove 需要 id 参数（task_anchor action=list 可查看 id）。" }],
+							details: { ok: false, reason: "missing_id" },
+						};
+					}
+					const before = tasks.length;
+					const next = tasks.filter((t) => t.id !== args.id);
+					if (next.length === before) {
+						return {
+							content: [{ type: "text", text: `未找到 id=${args.id} 的任务。` }],
+							details: { ok: false, reason: "not_found" },
+						};
+					}
+					saveTasks(next);
+					return {
+						content: [{ type: "text", text: `已删除任务 #${args.id}（剩余 ${next.length} 条）。` }],
+						details: { ok: true, removed: args.id, total: next.length },
 					};
 				}
 				case "list":

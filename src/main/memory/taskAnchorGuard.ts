@@ -102,6 +102,16 @@ export function buildAnchorGuidance(message: string, tasks: TaskAnchorItem[]): s
       );
     }
   }
+
+  // ④ 任务积压清理引导：待确认(review)或进行中(doing)任务过多时，主动引导用户清理——
+  // 用户反馈：任务锚积累大量未确认/过时任务时 agent 从不主动询问。
+  const stale = [...review, ...doing];
+  if (stale.length >= 4) {
+    guidance.push(
+      `⚠️ 当前有 ${stale.length} 个待确认/进行中任务（review=${review.length}, doing=${doing.length}），列表可能积压过时或重复登记。` +
+        `回复时请主动引导用户清理：确认完成的用 task_anchor update/complete 标记 done；过时/重复的用 task_anchor action=remove 删除（task_anchor action=list 查看 id）。`,
+    );
+  }
   return guidance;
 }
 
