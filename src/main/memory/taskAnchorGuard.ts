@@ -62,6 +62,65 @@ export function summarizeTaskText(text: string): string {
 }
 
 /**
+ * 对话增强：根据当前任务锚状态生成引导段（注入宿主指令，让 agent 引导用户确认任务 + 纠回偏离）。
+ * 三部分：
+ *  ① 确认意图：用户消息含确认/完成类词 + 有待确认(review)/进行中(doing)任务 → 引导 agent 标记完成
+ *  ② 进行中引导：有 doing 任务 → agent 回复结尾引导用户确认任务推进
+ *  ③ 任务纠回：当前消息与 doing 任务相关性低（非短句、非确认）→ 提示 agent 提醒用户任务未完成/需登记新任务
+ */
+export function buildAnchorGuidance(message: string, tasks: TaskAnchorItem[]): string[] {
+  const t = (message ?? "").trim();
+  const guidance: string[] = [];
+  const doing = tasks.filter((x) => x.status === "doing");
+  const review = tasks.filter((x) => x.status === "review");
+  if (doing.length === 0 && review.length === 0) return guidance;
+  // 短句（继续/然后呢/好的）不做纠回，避免误报
+  if (t.length < 6) return guidance;
+
+  // ① 确认意图检测
+  const CONFIRM_WORDS = ["确认", "完成", "搞定", "结束了", "可以了", "就这", "标完成", "done", "收工"];
+  const wantsConfirm = CONFIRM_WORDS.some((w) => t.includes(w));
+  if (wantsConfirm && review.length > 0) {
+    guidance.push(
+      `⚠️ 用户表达了确认/完成意图（涉及待确认任务：${review.map((x) => x.text).join("、")}）。请用 task_anchor update 将确认的任务标记 done（不确定时先与用户确认具体哪个）。`,
+    );
+  }
+
+  // ② 进行中任务引导
+  if (doing.length > 0) {
+    guidance.push(
+      `进行中任务：${doing.map((x) => x.text).join("、")}。回复结尾请引导用户确认任务推进：已完成/可以标记完成？还是继续推进？`,
+    );
+  }
+
+  // ③ 任务纠回：消息与 doing 任务相关性低时提醒（确认意图/新任务登记除外）
+  if (doing.length > 0 && !wantsConfirm) {
+    const relevant = doing.some((x) => textOverlap(t, x.text) >= 0.25);
+    if (!relevant) {
+      guidance.push(
+        `⚠️ 当前消息与进行中任务（${doing.map((x) => x.text).join("、")}）相关性低。若这是新任务请先 task_anchor add 登记；若是闲聊，请提醒用户任务尚未完成。`,
+      );
+    }
+  }
+  return guidance;
+}
+
+/** 文本重叠率：按双字组(bigram)重叠——单字符重叠会被「的/了/一」等常用字虚高 */
+function textOverlap(a: string, b: string): number {
+  const bigrams = (s: string): Set<string> => {
+    const out = new Set<string>();
+    for (let i = 0; i < s.length - 1; i++) out.add(s.slice(i, i + 2));
+    return out;
+  };
+  const sa = bigrams(a);
+  const sb = bigrams(b);
+  if (sa.size === 0 || sb.size === 0) return 0;
+  let hits = 0;
+  for (const g of sa) if (sb.has(g)) hits++;
+  return hits / Math.min(sa.size, sb.size);
+}
+
+/**
  * 任务锚强校验（agent_settled 时由主进程调用）：
  *   - 本轮存在任务型 user 消息但任务锚无对应登记 → 强制补登记 + 强提示。
  * 返回本次动作描述（供日志与通知使用）。

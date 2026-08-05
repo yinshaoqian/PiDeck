@@ -34,7 +34,7 @@ import { MemoryExtraction } from "./memory/memoryExtraction";
 import { EmbeddingService } from "./memory/embeddingService";
 import { buildMemoryInjection } from "./memory/memoryInjection";
 import { TaskAnchorStore } from "./memory/taskAnchorStore";
-import { enforceTaskAnchor, detectTaskIntent, summarizeTaskText } from "./memory/taskAnchorGuard";
+import { enforceTaskAnchor, detectTaskIntent, summarizeTaskText, buildAnchorGuidance } from "./memory/taskAnchorGuard";
 
 /**
  * 解析 agent 工作目录所属的项目 workspace id：从 cwd 逐级向上找 projectStore 中登记的项目根路径
@@ -3675,6 +3675,8 @@ function registerIpc() {
 			...(detectTaskIntent(input.message)
 				? [`⚠️ 本轮对话检测到任务型请求：「${summarizeTaskText(input.message)}」——必须在回复前用 task_anchor add 登记该任务（doing）。`]
 				: []),
+			// 对话增强：任务确认引导 + 纠回（根据当前任务状态生成，纯函数见 taskAnchorGuard）
+			...buildAnchorGuidance(input.message, anchorTasks),
 		].join("\n");
 		agentInstruction = agentInstruction ? `${anchorInstruction}\n\n${agentInstruction}` : anchorInstruction;
 
