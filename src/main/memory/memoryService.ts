@@ -38,12 +38,15 @@ const DIR_OF: Record<MemoryCategory, string> = {
   memory: "memories",
   skill: "skills",
   resource: "resources",
+  // 用户画像：提炼出的用户习惯/偏好/沟通风格，独立目录便于分类展示
+  profile: "profiles",
 };
 
 export function categoryOfDir(dir: string): MemoryCategory | null {
   if (dir === "memories") return "memory";
   if (dir === "skills") return "skill";
   if (dir === "resources") return "resource";
+  if (dir === "profiles") return "profile";
   return null;
 }
 
@@ -336,6 +339,7 @@ export class MemoryService {
       memories: s.memories,
       skills: s.skills,
       resources: s.resources,
+      profiles: s.profiles,
       byPriority: s.byPriority,
       expiringSoon: s.expiringSoon,
       dbPath: (this.db as unknown as { dbPath: string }).dbPath,
@@ -547,7 +551,7 @@ export class MemoryService {
       });
     }
 
-    const byDir: Record<string, Array<(typeof lines)[number]>> = { memories: [], skills: [], resources: [] };
+    const byDir: Record<string, Array<(typeof lines)[number]>> = { memories: [], skills: [], resources: [], profiles: [] };
     const codeEdits: Array<(typeof lines)[number]> = [];
     for (const l of lines) {
       if (l.isCodeEdit) codeEdits.push(l);
@@ -568,7 +572,7 @@ export class MemoryService {
       return out;
     };
 
-    const dirs = includeResources ? ["memories", "skills", "resources"] : ["memories"];
+    const dirs = includeResources ? ["memories", "skills", "resources", "profiles"] : ["memories"];
     const parts: string[] = [];
     const memoryEntries: MemoryL0Compact["memoryEntries"] = [];
 
@@ -642,7 +646,43 @@ export class MemoryService {
     if (dupTargets.size > 0) {
       duplicatesRemoved = this.db.removeNodes([...dupTargets]);
     }
-    if (purged > 0 || duplicatesRemoved > 0) this.emitChange();
-    return { purged, duplicatesRemoved };
+
+    // 零召回清理（低价值记忆治理）：没被任何会话召回过的记忆没有价值。
+    //  - P2 + 从未召回（accessCount=0）+ 创建 >2 天 → 直接删除（P2 本来就是短期，无召回即废）
+    //  - P1 + 从未召回 + 创建 >7 天 → 降级 P2（给第二次机会，下轮仍零召回则被删）
+    //  P0（用户画像/手动钉住）永不参与；不删 source=user 手动创建的（用户主动建的不动）。
+    const ZERO_RECALL_DELETE_DAYS = 2;
+    const ZERO_RECALL_DOWNGRADE_DAYS = 7;
+    const coldStart = Date.now();
+    let zeroRecallDeleted = 0;
+    let zeroRecallDowngraded = 0;
+    for (const node of all) {
+      if (node.priority === "P0" || node.source === "user") continue;
+      const ageDays = (coldStart - effectiveAtOf(node)) / (24 * 60 * 60 * 1000);
+      if (node.accessCount > 0) continue;
+      if (node.priority === "P2" && ageDays > ZERO_RECALL_DELETE_DAYS) {
+        zeroRecallDeleted += this.db.removeNodes([node.id]) ? 1 : 0;
+      } else if (node.priority === "P1" && ageDays > ZERO_RECALL_DOWNGRADE_DAYS) {
+        this.db.updateNode(node.id, { priority: "P2" });
+        zeroRecallDowngraded++;
+      }
+    }
+    // 提取消耗记录只保留最近 30 天（防表无限膨胀）
+    this.db.purgeOldUsage();
+    const purgedTotal = purged + zeroRecallDeleted;
+    if (purgedTotal > 0 || duplicatesRemoved > 0 || zeroRecallDowngraded > 0) this.emitChange();
+    return { purged: purgedTotal, duplicatesRemoved };
+  }
+
+  // ── 提取消耗统计（LLM usage） ────────────────────────
+
+  /** 记录一次 LLM 提取调用消耗（extract/dedup/distill） */
+  recordUsage(rec: { at: number; stage: string; provider: string; model: string; promptTokens: number; completionTokens: number }): void {
+    this.db.recordUsage(rec);
+  }
+
+  /** 提取消耗汇总（今日/累计/分阶段/分模型 + 最近明细） */
+  getUsageStats() {
+    return this.db.getUsageStats();
   }
 }

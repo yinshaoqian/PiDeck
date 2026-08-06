@@ -411,6 +411,11 @@ export type AppSettings = {
 	memoryInjectionEnabled: boolean;
 	/** 触发式记忆注入的单次注入条数上限 */
 	memoryInjectionTopK: number;
+	/**
+	 * 记忆提取专用模型（可独立于对话默认模型，用便宜模型跑提取/去重/蒸馏省成本）。
+	 * null = 跟随 pi 默认对话模型；设置后必须存在于 models.json 的 providers 中。
+	 */
+	memoryExtractionModel?: { provider: string; model: string } | null;
 	/** 是否启用 WSL fallback：在 Windows 自动检测不到 pi 时，尝试从 WSL 启动 pi */
 	wslEnabled: boolean;
 	/** WSL 发行版名称，如 Debian、Ubuntu */
@@ -1162,9 +1167,18 @@ export type SendPromptInput = {
 
 /** 主进程完成 pi prompt 预检后的明确接收结果。 */
 export type SendPromptResult =
-	| { accepted: true }
+	| { accepted: true; degradedImages?: boolean; imageCount?: number }
 	| { accepted: false; error: string; delivery?: "rejected" }
 	| { accepted: false; error: string; delivery: "unknown" };
+
+/** pi --list-models 解析出的模型能力，用于发送图片前判断当前模型是否支持视觉输入 */
+export type PiModelCapability = {
+	provider: string;
+	id: string;
+	name?: string;
+	thinking: boolean;
+	supportsImages: boolean;
+};
 
 /** 实时思考内容更新，用于流式展示模型推理过程 */
 export type ThinkingUpdate = {
@@ -1266,7 +1280,7 @@ export type ComposerAgentMode = "normal" | "plan";
  * LLM 提取+去重、关键词+优先级+时间衰减混合检索、生命周期清理。
  * ════════════════════════════════════════════════════════════════════ */
 
-export type MemoryCategory = "memory" | "skill" | "resource";
+export type MemoryCategory = "memory" | "skill" | "resource" | "profile";
 
 /** 任务锚状态机：进行中 → 调研完成·未确认 → 已完成（可回退/改文字） */
 export type TaskAnchorStatus = "doing" | "review" | "done";
@@ -1370,6 +1384,8 @@ export type MemoryStats = {
 	memories: number;
 	skills: number;
 	resources: number;
+	/** 用户画像数（category === "profile"） */
+	profiles: number;
 	byPriority: Record<MemoryPriority, number>;
 	/** 距过期 < 24h 的记忆数 */
 	expiringSoon: number;
@@ -1390,6 +1406,30 @@ export type MemoryStats = {
 export type MemoryL0Compact = {
 	text: string;
 	memoryEntries: Array<{ id: string; l0: string; priority: MemoryPriority; effectiveAt: number }>;
+};
+
+/** 单次 LLM 提取调用的 token 消耗（落库 extraction_usage） */
+export type ExtractionUsageRecord = {
+	stage: "extract" | "dedup" | "distill";
+	provider: string;
+	model: string;
+	promptTokens: number;
+	completionTokens: number;
+	at: number;
+};
+
+/** 提取消耗统计（UI 查看用：今日/累计/分阶段） */
+export type ExtractionUsageStats = {
+	/** 今日调用次数与 tokens */
+	today: { calls: number; promptTokens: number; completionTokens: number; totalTokens: number };
+	/** 累计调用次数与 tokens */
+	total: { calls: number; promptTokens: number; completionTokens: number; totalTokens: number };
+	/** 分阶段统计（extract/dedup/distill） */
+	byStage: Record<string, { calls: number; promptTokens: number; completionTokens: number }>;
+	/** 按模型统计（识别哪个模型在烧钱） */
+	byModel: Array<{ provider: string; model: string; calls: number; promptTokens: number; completionTokens: number; totalTokens: number }>;
+	/** 最近 20 条调用明细 */
+	recent: Array<ExtractionUsageRecord & { id: number }>;
 };
 
 /** 手动新增记忆的输入（面板「+ 新建」） */

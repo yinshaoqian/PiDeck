@@ -1209,6 +1209,10 @@ export function ModelPicker(props: {
 	favoriteModels: string[];
 	/** 切换收藏状态 */
 	onToggleFavorite: (provider: string, modelId: string) => void;
+	/** 当前默认模型 key（provider/modelId），用于标记「设为打开默认模型」状态 */
+	defaultModelKey?: string;
+	/** 把模型设为「打开会话时默认使用」：写入 pi settings.json 的 defaultProvider/defaultModel */
+	onSetDefault: (provider: string, modelId: string) => void;
 }) {
 	const [modelPickerSearch, setModelPickerSearch] = useState("");
 	const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
@@ -1283,6 +1287,7 @@ export function ModelPicker(props: {
 		const modelKey = `${model.provider}/${model.id}`;
 		const selected = modelKey === currentModelKey;
 		const favorited = favoritesSet.has(modelKey);
+		const isDefault = modelKey === props.defaultModelKey;
 		return (
 			<button
 				ref={selected ? selectedItemRef : undefined}
@@ -1290,6 +1295,24 @@ export function ModelPicker(props: {
 				className={`picker-palette-item${selected ? " selected" : ""}`}
 				onClick={() => props.onPick(model)}
 			>
+				{/* 设为默认模型按钮：实心图钉为当前默认，点击后写入 settings.json（打开会话时自动应用） */}
+				<span
+					className={`model-default-pin${isDefault ? " active" : ""}`}
+					title={
+						isDefault ? t("app.modelIsDefault") : t("app.modelSetDefault")
+					}
+					onClick={(e) => {
+						e.stopPropagation();
+						props.onSetDefault(model.provider, model.id);
+					}}
+				>
+					<Pin
+						size={13}
+						strokeWidth={1.8}
+						fill={isDefault ? "currentColor" : "none"}
+						aria-hidden="true"
+					/>
+				</span>
 				{/* 收藏/取消收藏按钮：填充星为收藏，空心为未收藏 */}
 				<span
 					className={`model-favorite-star${favorited ? ' favorited' : ''}`}

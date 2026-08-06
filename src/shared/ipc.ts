@@ -246,6 +246,8 @@ export const ipcChannels = {
 	memoryPin: "memory:pin",
 	/** 记忆统计（总数/类别/优先级/临近过期） */
 	memoryStats: "memory:stats",
+	/** 提取 LLM 消耗统计（今日/累计/分阶段） */
+	memoryUsage: "memory:usage",
 	/** 生成 L0 摘要索引（上下文注入用，仿 viking:// 索引） */
 	memoryL0Index: "memory:l0-index",
 	/** 主进程 → 渲染进程：记忆数据变化实时推送 */

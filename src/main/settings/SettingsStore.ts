@@ -123,6 +123,8 @@ Gitmoji 对应关系：
   // 触发式记忆注入默认开启；topK=3 保证注入量克制，不稀释模型注意力
   memoryInjectionEnabled: true,
   memoryInjectionTopK: 3,
+  // 记忆提取默认跟随对话默认模型；用户可单独指定便宜模型跑提取省成本
+  memoryExtractionModel: null,
   wslEnabled: false,
   wslDistro: "Ubuntu",
   wslUser: "root",

@@ -16,6 +16,9 @@ import { ConfigManager } from "../config/ConfigManager";
 import type { MemoryExtractInput, MemoryExtractionEvent, MemoryNode, MemoryPriority } from "../../shared/types";
 import { MemoryService } from "./memoryService";
 
+/** 一次 LLM 调用的 token 用量（三 API 归一化；无 usage 字段时为 null） */
+type ChatUsage = { promptTokens: number; completionTokens: number } | null;
+
 const EXTRACTION_SYSTEM_PROMPT = `你是 OpenViking 上下文提取助手，负责从对话中提取记忆（MEMORY）与技能（SKILL）。
 
 ## MEMORY = 持久知识
@@ -46,7 +49,7 @@ L2 中必须包含以下五个字段行（机器可解析）：
 验证证据: ...
 当会话产生了已验证的因果链时，优先输出 CAUSAL 块而不是普通的 SKILL #case——结构化因果链可复用性高得多。
 
-输出格式（严格 — 可输出 1 个 MEMORY 块、1 个 SKILL 块、1 个 CAUSAL 块、任意组合，或 "NO_EXTRACTION"）：
+输出格式（严格 — 可输出 1 个 MEMORY 块、1 个 SKILL 块、1 个 CAUSAL 块、1 个 PROFILE 块、任意组合，或 "NO_EXTRACTION"）：
 
 ===MEMORY===
 L0: 一句话摘要，50 字以内
@@ -72,23 +75,34 @@ PRIORITY: P1|P2
 TAGS: #causal-case #标签2 #标签3
 ANCHOR: 一句话描述何时该召回这个因果案例（触发场景）
 
+===PROFILE===
+L0: 一条用户画像，50 字以内（如「用户沟通风格：短句直接、要结论」）
+L1: 2-5 条要点概述（共 500 字以内）
+L2: 完整描述 + 必须引用用户亲口说出的原话（原文引用，不许转述、推断）
+PRIORITY: P0|P1
+TAGS: #profile #user_preference #标签2 #标签3
+ANCHOR: 一句话描述何时该召回这条画像（触发场景）
+
 优先级说明：
 - P1：值得长期保留的稳定事实（用户偏好、项目约定、架构、活跃工作流）。自动提取的默认值。
 - P2：短期/会话特有上下文、一次性修复。
-- 绝不输出 P0。P0（永久置顶）仅限用户手动设置——自动提取不得创建永久记忆。
+- 绝不输出 P0，除 PROFILE 块例外。P0（永久置顶）仅限手动设置或用户画像——用户偏好/身份是稳定事实，不过期；其他类型自动提取不得创建永久记忆。
 
 规则：
 1. 没有值得沉淀的内容就回复 "NO_EXTRACTION"
 2. 区分「过程日志」与「可复用方法」：做了什么、改了哪些文件、会话状态流转、构建输出、一次性调试过程（不记）；但「下次怎么修/怎么打包/怎么发布/怎么配置」是可复用方法（要记）。比如「执行了 npm run dist:win -- portable 且遇到 winCodeSign 符号链接报错，开启开发者模式后成功」——打包命令 + 踩坑解法是可复用 SKILL，不是过程日志。
 3. 绝不把 AI 的推断、总结、建议写成用户要求或偏好。用户偏好必须是用户原话。拿不准用户是否说过，就跳过。
 4. 拿不准时优先 NO_EXTRACTION——一条错误的记忆注入未来会话，比没有记忆更糟（用户原则：宁可不记也不记垃圾）。
-5. 跳过一次性任务、琐碎改动、问候、情绪表达、闲聊；但「用户/Agent 花了大量时间、多次尝试才成功的事」绝不跳过——那是最高价值的 LESSON（多轮尝试 + 最终有效的解法 = 必须提取）。
-6. 用具体事实，不要空泛建议
-7. 语言跟随对话内容
-8. SKILL 记录工具用法、报错修复、打包/发布/部署流程、环境配置、工作流发现；LESSON（#lesson）价值最高；CAUSAL（已验证的根因链）最可复用
-9. 每种类型最多一个块
-10. 本应标 P0 的，用 P1 代替
-11. 长会话你只会看到一部分（分段输入）：每段独立判断，不要因为「前面/后面还有内容」而不提取——你看到的就是该段全部。
+5. 一帆风顺的会话（无失败、无踩坑、无用户偏好表达）直接回复 NO_EXTRACTION——正常成功的过程不产记忆；没有失败就没有 LESSON。
+6. 跳过一次性任务、琐碎改动、问候、情绪表达、闲聊；但「用户/Agent 花了大量时间、多次尝试才成功的事」绝不跳过——那是最高价值的 LESSON（多轮尝试 + 最终有效的解法 = 必须提取）。
+7. 用具体事实，不要空泛建议
+8. 语言跟随对话内容
+9. SKILL 记录工具用法、报错修复、打包/发布/部署流程、环境配置、工作流发现；LESSON（#lesson）价值最高；CAUSAL（已验证的根因链）最可复用
+10. 状态快照不记："X 已实现""X 已接入""X 已迁移""X 可用""X 在 Y 监听"这类结论只对当下有效，会话结束即过时；除非是可复用的操作方法（怎么打包/怎么配置/怎么修复），否则不提取。
+11. 每种类型最多一个块
+12. PROFILE 仅在用户亲口表达偏好/习惯/工作方式/身份信号时提取；L2 必须引用原话；同一偏好已有画像时，倾向输出 MERGE 合并而不是新建（去重由后续流程完成）；拿不准就 NO_EXTRACTION
+13. 本应标 P0 的，用 P1 代替（PROFILE 块除外——画像允许 P0 永久存档）
+14. 长会话你只会看到一部分（分段输入）：每段独立判断，不要因为「前面/后面还有内容」而不提取——你看到的就是该段全部。
 
 示例：
 ===SKILL===
@@ -201,9 +215,9 @@ type ExtractedBlock = {
   l0: string;
   l1: string;
   l2: string;
-  priority: "P1" | "P2";
+  priority: "P0" | "P1" | "P2";
   tags: string[];
-  category: "memory" | "skill";
+  category: "memory" | "skill" | "profile";
   retrievalAnchor?: string;
   /** 结构化因果链（causal-case）：调试会话定位根因并验证后，提取机需保留机器可读字段 */
   causal?: {
@@ -238,6 +252,8 @@ export class MemoryExtraction {
     private readonly service: MemoryService,
     /** 结构化状态事件：start/progress/done/error，UI 据此区分进行中、完成与失败 */
     private readonly onEvent?: (ev: MemoryExtractionEvent) => void,
+    /** 读 PiDeck 应用设置（memoryExtractionModel：独立指定提取模型；null 跟随对话默认模型） */
+    private readonly getSettings?: () => { memoryExtractionModel?: { provider: string; model: string } | null },
   ) {}
 
   /** 推送进度阶段文本（progress 事件） */
@@ -378,7 +394,23 @@ export class MemoryExtraction {
     const names = Object.keys(providers);
     if (names.length === 0) return null;
 
-    // 优先 settings.json 的默认选择
+    // ① 用户指定了提取模型（PiDeck 设置 memoryExtractionModel）：优先使用，
+    //    独立于对话默认模型——可用便宜模型跑提取/去重/蒸馏省成本。
+    //    仅在 provider/model 存在于 models.json 时生效，否则静默回退默认模型。
+    const override = this.getSettings?.().memoryExtractionModel;
+    if (override?.provider && override.model && providers[override.provider]) {
+      const p = providers[override.provider];
+      if (p.models.some((m) => m.id === override.model)) {
+        const authKey = auth.parsed[override.provider]?.key ?? p.apiKey ?? "";
+        const baseUrl = p.baseUrl ?? (p.api === "anthropic-messages" ? "https://api.anthropic.com" : "https://api.openai.com/v1");
+        const api = this.normalizeApi(p.api);
+        if (baseUrl && authKey) {
+          return { provider: override.provider, model: override.model, baseUrl, apiKey: authKey, api };
+        }
+      }
+    }
+
+    // ② 兜底：settings.json 的默认选择
     const s = settings.parsed as { defaultProvider?: string; defaultModel?: string; providerDefaultModel?: Record<string, string> };
     let providerName = s.defaultProvider && providers[s.defaultProvider] ? s.defaultProvider : names[0];
     const provider = providers[providerName];
@@ -410,22 +442,22 @@ export class MemoryExtraction {
     }
   }
 
-  /** 调 LLM 聊天补全（兼容三种 API），返回完整文本；content 为空时加大 max_tokens 重试一次 */
+  /** 调 LLM 聊天补全（兼容三种 API），返回完整文本 + usage；content 为空时加大 max_tokens 重试一次 */
   private async chat(
     model: { baseUrl: string; apiKey: string; api: string; model: string },
     system: string,
     user: string,
-  ): Promise<string> {
+  ): Promise<{ text: string; usage: ChatUsage }> {
     for (const attempt of [1, 2]) {
       const maxTokens = attempt === 1 ? 4096 : 8192;
-      const text = await this.chatOnce(model, system, user, maxTokens);
-      if (text && text.trim()) return text;
+      const r = await this.chatOnce(model, system, user, maxTokens);
+      if (r.text && r.text.trim()) return r;
       // reasoning 模型（如 deepseek-v4-flash）token 不足时 content 可能为空，重试加大预算
       if (attempt === 1) {
         this.emitProgress("LLM 返回为空，加大 token 预算重试…");
       }
     }
-    return "";
+    return { text: "", usage: null };
   }
 
   private async chatOnce(
@@ -433,7 +465,7 @@ export class MemoryExtraction {
     system: string,
     user: string,
     maxTokens: number,
-  ): Promise<string> {
+  ): Promise<{ text: string; usage: ChatUsage }> {
     const base = model.baseUrl.replace(/\/+$/, "");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 180_000);
@@ -456,8 +488,15 @@ export class MemoryExtraction {
           signal: controller.signal,
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-        const data = (await res.json()) as { content?: Array<{ type: string; text?: string }> };
-        return (data.content ?? []).map((c) => c.text ?? "").join("");
+        const data = (await res.json()) as { content?: Array<{ type: string; text?: string }>; usage?: { input_tokens?: number; output_tokens?: number } };
+        const text = (data.content ?? []).map((c) => c.text ?? "").join("");
+        return {
+          text,
+          usage:
+            data.usage != null
+              ? { promptTokens: data.usage.input_tokens ?? 0, completionTokens: data.usage.output_tokens ?? 0 }
+              : null,
+        };
       }
 
       if (model.api === "google-generative-ai") {
@@ -474,8 +513,21 @@ export class MemoryExtraction {
           },
         );
         if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-        const data = (await res.json()) as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
-        return data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+        const data = (await res.json()) as {
+          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+          usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number };
+        };
+        const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+        return {
+          text,
+          usage:
+            data.usageMetadata != null
+              ? {
+                  promptTokens: data.usageMetadata.promptTokenCount ?? 0,
+                  completionTokens: data.usageMetadata.candidatesTokenCount ?? 0,
+                }
+              : null,
+        };
       }
 
       // openai-completions 默认
@@ -497,14 +549,72 @@ export class MemoryExtraction {
         signal: controller.signal,
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-      const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-      return data.choices?.[0]?.message?.content ?? "";
+      const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }>; usage?: { prompt_tokens?: number; completion_tokens?: number } };
+      return {
+        text: data.choices?.[0]?.message?.content ?? "",
+        usage:
+          data.usage != null
+            ? { promptTokens: data.usage.prompt_tokens ?? 0, completionTokens: data.usage.completion_tokens ?? 0 }
+            : null,
+      };
     } finally {
       clearTimeout(timeout);
     }
   }
 
+  /** 记录一次 LLM 提取调用消耗（落库 extraction_usage，供 UI 统计查看） */
+  private recordUsage(stage: "extract" | "dedup" | "distill", model: { provider: string; model: string }, usage: ChatUsage): void {
+    if (!usage || usage.promptTokens <= 0 && usage.completionTokens <= 0) return;
+    try {
+      this.service.recordUsage({ at: Date.now(), stage, provider: model.provider, model: model.model, ...usage });
+    } catch {
+      /* 统计失败不影响提取主流程 */
+    }
+  }
+
   // ── 提取 ──────────────────────────────────────────────
+
+  /**
+   * 入口预筛：判断会话是否含「踩坑信号」——没有则不值得调 LLM 提取。
+   * 低价值记忆治理的核心：普通一帆风顺的会话产出大量泛泛 skill（状态快照/过程记录），
+   * 体检发现记忆库 78/84 是 skill 类。命中任一信号才值得提取：
+   *  - 工具调用报错 / rejected
+   *  - 用户消息含否定/报错/挫败词（不对、崩了、卡住、失败、报错、没搞定…）
+   *  - 用户要求“记住/沉淀/总结”类（主动记忆意图）
+   *  - 对话中明显的错误文本（Error/Exception/Failed…）
+   */
+  hasPitfallSignal(msgs: Array<{ role: string; text?: string; content?: unknown; meta?: Record<string, unknown>; isError?: boolean }>): boolean {
+    if (!msgs || msgs.length === 0) return false;
+    // 用户否定/挫败/报错信号（中文为主，兼容英文）——只用强信号词，
+    // 避免「问题/异常/太久」等泛词误命中（用户说「解决这个问题」不应算踩坑信号）
+    const userNegation =
+      /不对|不是这样|没搞定|搞不定|崩了|卡住|卡死|失败|报错|出错|怎么不行|还是不|又(不行|坏了|没了|崩|挂)|白屏|转圈|没法|不行了|不好用|难用|受不了|等好久|没反应|不能用|不生效|丢(了|数据|消息)|错乱|混乱|奇怪|离谱|诡异|垃圾|傻|fuck|bug|error|fail|broken|not working|doesn't work|does not work/i;
+    const askRemember = /记住|沉淀|提取|记录一下|总结成|写成记忆|记下来|保存到记忆|这个经验|这个教训|踩坑/;
+
+    const textOf = (m: { role?: string; text?: string; content?: unknown }): string => {
+      if (typeof m.text === "string" && m.text.length > 0) return m.text;
+      if (typeof m.content === "string") return m.content;
+      if (Array.isArray(m.content)) {
+        return m.content.map((c) => (typeof c === "object" && c && "text" in c ? String((c as { text: unknown }).text ?? "") : typeof c === "string" ? c : "")).join(" ");
+      }
+      return "";
+    };
+
+    for (const m of msgs) {
+      const role = String(m.role ?? "");
+      // 工具执行失败是最强信号：readMessages/AgentManager 用 meta.isError 标记，不用文本猜
+      if (role === "tool" || role === "toolResult") {
+        if (m.isError || (m.meta && m.meta.isError === true)) return true;
+        continue;
+      }
+      const text = textOf(m);
+      if (!text) continue;
+      if (role === "user") {
+        if (userNegation.test(text) || askRemember.test(text)) return true;
+      }
+    }
+    return false;
+  }
 
   /** 主入口：分析会话 → 提取 → 去重 → 落库；返回本次新增/合并结果 */
   async analyzeAndSave(input: MemoryExtractInput): Promise<{
@@ -535,7 +645,9 @@ export class MemoryExtraction {
       const conv = convs[wi];
       let raw: string;
       try {
-        raw = (await this.chat(model, EXTRACTION_SYSTEM_PROMPT, conv)).trim();
+        const r = await this.chat(model, EXTRACTION_SYSTEM_PROMPT, conv);
+        raw = r.text.trim();
+        this.recordUsage("extract", model, r.usage);
       } catch (e) {
         const msg = `LLM 调用失败（窗口 ${wi + 1}/${convs.length}）：${e instanceof Error ? e.message : String(e)}`;
         this.onEvent?.({ type: "error", message: msg });
@@ -719,7 +831,9 @@ export class MemoryExtraction {
 
     let raw: string;
     try {
-      raw = await this.chat(model, DISTILL_SYSTEM_PROMPT, user);
+      const r = await this.chat(model, DISTILL_SYSTEM_PROMPT, user);
+      raw = r.text;
+      this.recordUsage("distill", model, r.usage);
     } catch {
       return null;
     }
@@ -824,7 +938,8 @@ export class MemoryExtraction {
       l0: block.l0,
       l1: block.l1,
       l2: block.l2,
-      priority: block.priority === "P2" ? ("P2" as const) : ("P1" as const),
+      // PROFILE 块放行 P0（用户画像永久存档），其余类型 P0 已在上游降级为 P1
+      priority: block.priority === "P0" ? ("P0" as const) : block.priority === "P2" ? ("P2" as const) : ("P1" as const),
       tags: block.tags,
       category: block.category,
       source: "conversation" as const,
@@ -865,8 +980,9 @@ export class MemoryExtraction {
         .join("\n\n");
       const user = `## NEW CANDIDATE (${candidate.category})\nL0: ${candidate.l0}\nL1: ${candidate.l1}\nL2: ${candidate.l2}\nPRIORITY: ${candidate.priority}\nTAGS: ${candidate.tags.map((t) => `#${t}`).join(" ")}\n\n## EXISTING MEMORIES\n${existingText}\n\nDecide:`;
       try {
-        const raw = await this.chat(model, DEDUP_SYSTEM_PROMPT, user);
-        decision = this.parseDedup(raw, similar);
+        const r = await this.chat(model, DEDUP_SYSTEM_PROMPT, user);
+        decision = this.parseDedup(r.text, similar);
+        this.recordUsage("dedup", model, r.usage);
       } catch {
         decision = { decision: "create", reason: "dedup call failed" };
       }
@@ -943,14 +1059,14 @@ export class MemoryExtraction {
 
   // ── 解析 ──────────────────────────────────────────────
 
-  /** 解析 ===MEMORY=== / ===SKILL=== / ===CAUSAL=== 块 */
+  /** 解析 ===MEMORY=== / ===SKILL=== / ===CAUSAL=== / ===PROFILE=== 块 */
   private parseExtraction(raw: string): ExtractedBlock[] {
     const blocks: ExtractedBlock[] = [];
     const re = /===\s*(\w+)\s*===([\s\S]*?)(?====\s*\w+\s*===|$)/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(raw)) !== null) {
       const kind = m[1].toUpperCase();
-      if (kind !== "MEMORY" && kind !== "SKILL" && kind !== "CAUSAL") continue;
+      if (kind !== "MEMORY" && kind !== "SKILL" && kind !== "CAUSAL" && kind !== "PROFILE") continue;
       const body = m[2].trim();
       const l0m = body.match(/^L0:\s*(.+)$/m);
       if (!l0m) continue;
@@ -962,7 +1078,10 @@ export class MemoryExtraction {
       const l0 = l0m[1].trim();
       const l1 = (l1m?.[1] ?? "").trim() || l0;
       const l2 = (l2m?.[1] ?? "").trim() || l1;
-      const priority = pm?.[1] === "P2" ? "P2" : pm?.[1] === "P0" ? "P1" : "P1"; // P0 降级 P1
+      // PROFILE（用户画像）放行 P0 永久存档——用户偏好/身份是稳定事实，不过期；
+      // 其他类型 P0 仍降级 P1（防止自动提取创建永久记忆，P0 仅限手动钉住）。
+      const isProfile = kind === "PROFILE";
+      const priority = pm?.[1] === "P2" ? "P2" : pm?.[1] === "P0" ? (isProfile ? "P0" : "P1") : "P1";
       const tags = (tm?.[1]?.match(/#(\w+)/g) ?? []).map((t) => t.slice(1));
       // CAUSAL 块：从 L2 提取结构化因果字段（SYMPTOM/ROOT_CAUSE/TRIED_AND_FAILED/FIX/VERIFIED_BY），
       // 存入 metadata.causal 供触发式注入格式化、L0 索引、召回展示直接使用。
@@ -974,7 +1093,7 @@ export class MemoryExtraction {
         l2,
         priority,
         tags: isCausal && !tags.includes("causal-case") ? ["causal-case", ...tags] : tags,
-        category: "skill",
+        category: isProfile ? "profile" : "skill",
         retrievalAnchor: am?.[1]?.trim() || undefined,
         ...(causal ? { causal } : {}),
       });

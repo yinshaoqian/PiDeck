@@ -215,6 +215,7 @@ import type {
 	MemoryExtractInput,
 	MemoryNode,
 	ChatMessage,
+	PiModelCapability,
 	PiPromptTemplateSummary,
 	PromptStoreSearchResult,
 	PromptStoreSearchResponse,
@@ -337,15 +338,15 @@ async function syncWslEnvironment(settings: AppSettings): Promise<WslEnvironment
 }
 
 /**
- * 解析 pi --list-models 表格输出为 AvailableModel[]。
+ * 解析 pi --list-models 表格输出为模型能力列表。
  * 表格格式：provider  model  context  max-out  thinking  images
  */
-function parsePiListModels(stdout: string): Array<{ provider: string; id: string; name?: string; thinking: boolean; supportsImages: boolean }> {
+function parsePiListModels(stdout: string): PiModelCapability[] {
 	const lines = stdout.split(/\r?\n/).filter(Boolean);
 	if (lines.length < 2) return [];
 	// 跳过表头
 	const dataLines = lines.slice(1);
-	const models: Array<{ provider: string; id: string; name?: string; thinking: boolean; supportsImages: boolean }> = [];
+	const models: PiModelCapability[] = [];
 	for (const line of dataLines) {
 		// 列1: provider, 列2: model, 列6: thinking (yes/no), 列7: images (yes/no)
 		const parts = line.trim().split(/\s+/);
@@ -1534,6 +1535,62 @@ function registerFeishuIpc() {
 	});
 }
 
+// 从 pi --list-models 获取可用模型列表（无需启动 agent）
+// 全局缓存：首次运行后复用，避免每次打开选择器都 fork 子进程。
+// 定义在 registerIpc 外：AgentManager 初始化（registerIpc 外）也需要用这张能力表判断图片支持。
+let cachedListModels: PiModelCapability[] | null = null;
+let cachedListModelsPending: Promise<PiModelCapability[]> | null = null;
+/**
+ * 获取模型能力表（provider/id → supportsImages）。
+ * 带全局缓存：首次调用后复用；同时供模型选择器和 AgentManager 发送图片时判断能力使用。
+ */
+const getPiModelCapabilities = async (): Promise<PiModelCapability[]> => {
+	try {
+		if (cachedListModels) return cachedListModels;
+		// 已有在途请求时复用同一个 Promise，避免并发 fork 多个 pi 进程
+		if (cachedListModelsPending) return cachedListModelsPending;
+
+		cachedListModelsPending = (async () => {
+			const settings = settingsStore.get();
+			const command = piLocator.resolveCommand(
+				settings.customPiPath,
+				settings.wslEnabled,
+				settings.wslDistro,
+				settings.wslUser,
+			);
+			const invocation = piLocator.createInvocation(command, ["--list-models"]);
+			const { execFile } = await import("node:child_process");
+			const result = await new Promise<{ stdout: string }>((resolve, reject) => {
+				execFile(invocation.command, invocation.args, {
+					env: piLocator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl),
+					shell: invocation.shell,
+					windowsHide: true,
+					timeout: 15_000,
+					encoding: "utf8",
+					windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+				}, (error, stdout, stderr) => {
+					if (error) {
+						const message = (stderr || error.message).slice(0, 300);
+						reject(new Error(message));
+					} else {
+						resolve({ stdout });
+					}
+				});
+			});
+			const models = parsePiListModels(result.stdout);
+			cachedListModels = models;
+			return models;
+		})();
+		return await cachedListModelsPending;
+	} catch (error) {
+		cachedListModelsPending = null;
+		void appLogger.warn("pi", "Failed to list models", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return [];
+	}
+};
+
 function registerIpc() {
 	// 获取当前环境过滤后的项目列表（WSL 模式只显示 WSL 项目，Chat 始终显示）
 	const getVisibleProjects = () => {
@@ -2631,56 +2688,8 @@ function registerIpc() {
 		});
 		return status;
 	});
-	// 从 pi --list-models 获取可用模型列表（无需启动 agent）
-	// 全局缓存：首次运行后复用，避免每次打开选择器都 fork 子进程
-	let cachedListModels: ReturnType<typeof parsePiListModels> | null = null;
-	let cachedListModelsPending: Promise<ReturnType<typeof parsePiListModels>> | null = null;
 	ipcMain.handle(ipcChannels.projectsListModels, async (_event, projectId?: string) => {
-		try {
-			if (cachedListModels) return cachedListModels;
-			// 已有在途请求时复用同一个 Promise，避免并发 fork 多个 pi 进程
-			if (cachedListModelsPending) return cachedListModelsPending;
-
-			cachedListModelsPending = (async () => {
-				const settings = settingsStore.get();
-				const command = piLocator.resolveCommand(
-					settings.customPiPath,
-					settings.wslEnabled,
-					settings.wslDistro,
-					settings.wslUser,
-				);
-				const invocation = piLocator.createInvocation(command, ["--list-models"]);
-				const { execFile } = await import("node:child_process");
-				const result = await new Promise<{ stdout: string }>((resolve, reject) => {
-					execFile(invocation.command, invocation.args, {
-						env: piLocator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl),
-						shell: invocation.shell,
-						windowsHide: true,
-						timeout: 15_000,
-						encoding: "utf8",
-						windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-					}, (error, stdout, stderr) => {
-						if (error) {
-							const message = (stderr || error.message).slice(0, 300);
-							reject(new Error(message));
-						} else {
-							resolve({ stdout });
-						}
-					});
-				});
-				const models = parsePiListModels(result.stdout);
-				cachedListModels = models;
-				return models;
-			})();
-			const models = await cachedListModelsPending;
-			return models;
-		} catch (error) {
-			cachedListModelsPending = null;
-			void appLogger.warn("pi", "Failed to list models", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-			return [];
-		}
+		return getPiModelCapabilities();
 	});
 	// 智能查找 wsl.exe：优先绝对路径（含 32-bit Sysnative 绕过），全部不存在时回退到 PATH
 	const wslExeResolved = (() => {
@@ -3602,44 +3611,11 @@ function registerIpc() {
 	);
 	ipcMain.handle(ipcChannels.agentsStop, async (_event, agentId: string) => {
 		terminalManager.closeAgent(agentId);
-		// 在 stop 销毁 agent 前拿到消息与 sessionId，供异步沉淀记忆
-		const tab = agentManager.list().find((t) => t.id === agentId);
-		const messages = agentManager.getMessages(agentId);
 		await agentManager.stop(agentId);
 		void appLogger.info("agent", "Agent stopped", { agentId });
-		// Viking 记忆提取：会话关闭后异步把讨论沉淀为记忆节点（thread_id 关联会话），
-		// 供后续任何会话通过 pi-deck-memory 的 search_memory 跨会话召回。
-		// 仅当消息数足够且有 sessionId 时触发；失败静默不影响关闭流程。
-		// 净化原则：记忆只沉淀“agent 讨论出的问题/结论/经验”——
-		// user/assistant 全量进提取；tool 只传元信息（工具名 + 命令/路径参数），
-		// 不传工具输出原文（脏数据），减少 LLM 提取的 token 消耗并避免噪音污染记忆。
-		if (tab && messages.length >= 8) {
-			const workspaceId = projectStore.list().find((p) => p.kind !== "chat")?.path ?? null;
-			void memoryExtraction
-				.analyzeAndSave({
-					messages: messages.map((m) => {
-						if (m.role === "tool") {
-							const meta = m.meta as Record<string, unknown> | undefined;
-							return {
-								role: m.role,
-								content: m.text,
-								// 让 memoryExtraction 的 toolBrief 提取“做了什么”（工具名+命令/路径）
-								name: typeof meta?.toolName === "string" ? meta.toolName : undefined,
-								params: meta?.args,
-							};
-						}
-						return { role: m.role, content: m.text };
-					}),
-					threadId: tab.sessionId ?? undefined,
-					workspaceId,
-				})
-				.catch((error) => {
-					void appLogger.warn("memory", "Agent stop memory extraction failed", {
-						agentId,
-						error: error instanceof Error ? error.message : String(error),
-					});
-				});
-		}
+		// 记忆提取统一由 1 小时低频轮询（runAutoExtract）负责——
+		// 用户反馈 stop 时即时提取调用太频繁（每次停 agent 都触发一轮 LLM），
+		// 且轮询路径拿到的 user/assistant 会话内容与内存消息一致，提取质量无损。
 	});
 	ipcMain.handle(ipcChannels.agentsPrompt, async (_event, input: SendPromptInput) => {
 		const bridge = feishuBridge;
@@ -4150,6 +4126,8 @@ function sendTelemetryHeartbeat() {
 	});
 	ipcMain.handle(ipcChannels.memoryPin, (_e, id: string, pinned: boolean) => memoryService.pin(id, pinned));
 	ipcMain.handle(ipcChannels.memoryStats, () => memoryService.getStats(currentWorkspace()));
+	// 提取 LLM 消耗统计（今日/累计/分阶段/分模型 + 最近明细），供 MemoryPanel 查看
+	ipcMain.handle(ipcChannels.memoryUsage, () => memoryService.getUsageStats());
 	ipcMain.handle(ipcChannels.memoryL0Index, (_e, opts?: { budget?: number; includeResources?: boolean }) => {
 		return memoryService.getL0Compact(currentWorkspace(), opts?.budget ?? 3200, opts?.includeResources ?? true);
 	});
@@ -4261,9 +4239,15 @@ app.whenReady().then(async () => {
 		.catch(() => {
 			/* 模型不可用：降级纯关键词检索，静默 */
 		});
-	memoryExtraction = new MemoryExtraction(configManager, memoryService, (ev) => {
-		mainWindow?.webContents.send(ipcChannels.memoryExtractionEvent, ev);
-	});
+	memoryExtraction = new MemoryExtraction(
+		configManager,
+		memoryService,
+		(ev) => {
+			mainWindow?.webContents.send(ipcChannels.memoryExtractionEvent, ev);
+		},
+		// 独立提取模型：读 PiDeck 设置 memoryExtractionModel（用户可在设置中单独指定便宜模型跑提取）
+		() => settingsStore.get(),
+	);
 	// 任务锚：持久化 + 监听文件变化（Agent 扩展写文件 → 推送 renderer 刷新）
 	taskAnchorStore = new TaskAnchorStore();
 	taskAnchorStore.watch(() => {
@@ -4328,6 +4312,9 @@ app.whenReady().then(async () => {
 			});
 			notifyTaskAnchorChanged();
 		},
+		// 模型能力表（provider/id → supportsImages）：发送图片前判断当前模型是否支持视觉，
+		// 不支持时走图片落盘降级（见 AgentManager.sendPrompt），避免 pi 把图片替换为无用占位文本。
+		() => getPiModelCapabilities(),
 	);
 	// ── 会话结束自动提取记忆（低频轮询版） ────────────────
 	// 用户反馈：agent_settled 即时提取调用太频繁（每个会话结束都跑）。改为定时轮询：
@@ -4370,6 +4357,15 @@ app.whenReady().then(async () => {
 					if (msgs.length < 4) {
 						// 过短会话不值得提取，同样标记避免下轮反复重扫
 						memoryService.markSessionExtracted(session.filePath);
+						continue;
+					}
+					// 入口预筛（低价值治理）：无踩坑信号（工具错误/报错/用户否定/多次尝试）的会话
+					// 直接标记跳过、不调 LLM——普通“一帆风顺”会话产出大量泛泛 skill 是记忆库污染的
+					// 主要来源（体检发现 78/84 是 skill，含大量状态快照/过程记录）。
+					// 传完整 msgs（含 meta.isError），让提取器用结构字段判断而非文本猜测。
+					if (!memoryExtraction.hasPitfallSignal(msgs)) {
+						memoryService.markSessionExtracted(session.filePath);
+						void appLogger?.info("memory", "Auto extract skipped (no pitfall signal)", { session: session.filePath });
 						continue;
 					}
 					const extractInput: MemoryExtractInput = {

@@ -11763,6 +11763,31 @@ body.is-composer-resizing .composer-resize-handle::after {
   border-radius: var(--radius-md);
 }
 
+/* 模型「设为默认」图钉：accent 色高亮，与收藏星标（warning 色）语义区分 */
+.model-default-pin {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--color-text-quaternary);
+  cursor: pointer;
+  transition:
+    color 0.15s,
+    transform 0.15s;
+  border-radius: var(--radius-md);
+}
+
+.model-default-pin:hover {
+  color: var(--color-accent);
+  transform: scale(1.15);
+}
+
+.model-default-pin.active {
+  color: var(--color-accent);
+}
+
 .model-favorite-star:hover {
   color: var(--color-warning);
   transform: scale(1.15);
@@ -22188,6 +22213,7 @@ body.is-git-pane-resizing, body.is-git-pane-resizing * { cursor: row-resize !imp
 .memory-cat.cat-memory { color: #7c3aed; background: color-mix(in srgb, #7c3aed 12%, transparent); }
 .memory-cat.cat-skill { color: #059669; background: color-mix(in srgb, #059669 12%, transparent); }
 .memory-cat.cat-resource { color: #d97706; background: color-mix(in srgb, #d97706 12%, transparent); }
+.memory-cat.cat-profile { color: #2563eb; background: color-mix(in srgb, #2563eb 12%, transparent); }
 .memory-l0 {
   flex: 1;
   min-width: 0;
@@ -22594,6 +22620,7 @@ body.is-git-pane-resizing, body.is-git-pane-resizing * { cursor: row-resize !imp
   gap: 6px;
 }
 .memory-insight-grid.cols4 { grid-template-columns: repeat(4, 1fr); }
+.memory-insight-grid.cols5 { grid-template-columns: repeat(5, 1fr); }
 .memory-insight-metric {
   display: flex;
   flex-direction: column;

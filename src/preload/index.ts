@@ -35,6 +35,7 @@ import type {
 	MemoryNode,
 	MemorySearchResult,
 	MemoryStats,
+	ExtractionUsageStats,
 	ProjectResourceListResult,
 	PetAggregateState,
 	PetManifest,
@@ -1278,6 +1279,8 @@ const api = {
 			ipcRenderer.invoke(ipcChannels.memoryPin, id, pinned) as Promise<boolean>,
 		stats: () =>
 			ipcRenderer.invoke(ipcChannels.memoryStats) as Promise<MemoryStats>,
+		usage: () =>
+			ipcRenderer.invoke(ipcChannels.memoryUsage) as Promise<ExtractionUsageStats>,
 		l0Index: (opts?: { budget?: number; includeResources?: boolean }) =>
 			ipcRenderer.invoke(ipcChannels.memoryL0Index, opts) as Promise<MemoryL0Compact>,
 		lifecycle: () =>

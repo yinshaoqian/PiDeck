@@ -1,7 +1,7 @@
 import { app, type BrowserWindow, Notification } from "electron";
 import { randomUUID } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { existsSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import type {
@@ -13,6 +13,7 @@ import type {
 	ForkMessage,
 	ImageContent,
 	MemoryInjectionEntry,
+	PiModelCapability,
 	Project,
 	SendPromptInput,
 	SendPromptResult,
@@ -175,6 +176,12 @@ export class AgentManager {
 		private readonly appLogger?: AppLogger,
 		/** agent 真正空闲（agent_settled，非 abort/error）时回调——用于任务锚自动回写等 */
 		private readonly onAgentSettled?: (agentId: string) => void,
+		/**
+		 * 模型能力表（provider/id → supportsImages），来自 pi --list-models 缓存。
+		 * 发送图片前判断当前模型是否支持视觉输入；不支持时图片落盘降级，
+		 * 避免 pi 把图片替换成无意义的占位文本塞进上下文。
+		 */
+		private readonly getModelCapabilities?: () => Promise<PiModelCapability[]>,
 	) {}
 
 	configureWsl(environment: WslEnvironment | null): void {
@@ -880,6 +887,14 @@ export class AgentManager {
 					? `${project.name} 历史会话`
 					: `${project.name} agent`);
 			tab.status = "idle";
+			// 应用用户配置的默认模型（settings.json 的 defaultProvider/defaultModel）。
+			// 新会话时 pi 可能已按 settings 选好模型，但历史会话恢复会还原会话内保存的模型，
+			// 这里在启动收敛后统一按用户默认模型覆盖，保证「点击打开 → 就是默认模型」的预期。
+			// 失败只记日志，不影响 agent 可用性。
+			void this.applyDefaultModel(
+				id,
+				(data as { model?: { provider?: string; id?: string } } | undefined)?.model,
+			);
 			// 若因桌面兼容性自动跳过了 codeisland 等扩展，给用户一条系统说明，避免「扩展在却不生效」困惑。
 			const blockedOnStart = process.getDiagnostics()?.blockedExtensions;
 			if (blockedOnStart && blockedOnStart.length > 0) {
@@ -1081,12 +1096,42 @@ export class AgentManager {
 		// 后续消息必须带 streamingBehavior 否则 pi 直接返回 error。这里自动兜底。
 		// images 用于传递粘贴/拖拽的图片，pi 会将 base64 图片直接传给支持视觉的模型。
 		try {
+			// ── 图片能力检查：模型不支持视觉时落盘降级 ──
+			// pi 在模型不支持图片时会把 image 内容替换为 "Image reading is disabled." 占位文本，
+			// 模型既看不到图片内容也拿不到路径，只能盲猜或翻临时目录，浪费大量上下文。
+			// 这里在发送前拦截：查能力表 → 不支持则把图片落盘到固定目录，
+			// 并在发给模型的指令里给出图片路径 + img_read 工具指引，让 agent 一步定位图片。
+			let effectiveMessage = agentMessage;
+			let effectiveImages: ImageContent[] | undefined = hasImages ? input.images : undefined;
+			let degradedImages = false;
+			if (hasImages && this.getModelCapabilities) {
+				try {
+					const capabilities = await this.getModelCapabilities();
+					const model = capabilities.length > 0 ? await this.getCurrentAgentModel(runtime) : null;
+					const cap = model
+						? capabilities.find((c) => c.provider === model.provider && c.id === model.id)
+						: undefined;
+					// 能力表里查不到该模型（cap 为空）时保守保持原行为，避免误降级支持图片的模型
+					if (cap && !cap.supportsImages) {
+						const savedPaths = await this.saveImagesToDisk(input.images!, runtime);
+						degradedImages = true;
+						effectiveImages = undefined;
+						effectiveMessage = `${agentMessage}\n\n${AgentManager.buildImageDegradeHint(savedPaths, input.images!.length)}`;
+					}
+				} catch (error) {
+					// 能力查询/落盘失败不阻断发送，回退原行为直接传图片
+					void this.appLogger?.warn("agent", "Image capability check failed, fallback to direct images", {
+						agentId: input.agentId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
 			const promptIsExtensionCommand = await this.promptMatchesRegisteredExtensionCommand(runtime, agentMessage);
 			const requestPayload: Record<string, unknown> = {
 				type: "prompt",
-				message: agentMessage,
+				message: effectiveMessage,
 				...(input.description ? { description: input.description } : {}),
-				...(hasImages ? { images: input.images } : {}),
+				...(effectiveImages && effectiveImages.length > 0 ? { images: effectiveImages } : {}),
 			};
 			// 如果 agent 已经忙碌且调用方没指定 streamingBehavior，默认用 steer；
 			// 与上方用户消息 meta 保持同一个计算结果，避免 UI 标记和实际 RPC 语义不一致。
@@ -1115,7 +1160,9 @@ export class AgentManager {
 				// 推导：不能等 agent_end；只有 Pi get_state 明确报告无剩余工作时才恢复 idle。
 				this.scheduleIdleCheckAfterExtensionCommand(input.agentId);
 			}
-			return { accepted: true };
+			return degradedImages
+				? { accepted: true, degradedImages: true, imageCount: input.images?.length ?? 0 }
+				: { accepted: true };
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
 			// prompt RPC 调用前已通过同步 write() 写入 pi stdin；此处所有异常都只说明
@@ -1130,6 +1177,80 @@ export class AgentManager {
 			this.emitState();
 			return { accepted: false, error: errorMessage, delivery: "unknown" };
 		}
+	}
+
+	/**
+	 * 查询当前 agent 实际运行的模型（provider/id）。
+	 * 图片降级前用来匹配能力表；查询失败返回 null，由调用方保守回退原行为。
+	 */
+	private async getCurrentAgentModel(runtime: AgentRuntime): Promise<{ provider: string; id: string } | null> {
+		try {
+			const response = await runtime.process.client.request({ type: "get_state" }, 5_000);
+			const model = (response.data as any)?.model;
+			if (model && typeof model.provider === "string" && typeof model.id === "string") {
+				return { provider: model.provider, id: model.id };
+			}
+		} catch {
+			// get_state 失败（进程忙碌/重启中等）按未知处理
+		}
+		return null;
+	}
+
+	/** 图片 MIME → 文件扩展名映射；未知类型按 png 落盘 */
+	private static readonly IMAGE_MIME_EXT: Record<string, string> = {
+		"image/png": "png",
+		"image/jpeg": "jpg",
+		"image/jpg": "jpg",
+		"image/webp": "webp",
+		"image/gif": "gif",
+		"image/bmp": "bmp",
+	};
+
+	/**
+	 * 把粘贴/拖拽的 base64 图片落盘到固定目录（系统临时目录下 pideck-images/）。
+	 * 模型不支持图片时，agent 只需按提示路径即可用 img_read 读图，无需在临时目录乱翻。
+	 * WSL 场景返回 Linux 路径，保证 agent 能直接访问。
+	 */
+	private async saveImagesToDisk(images: ImageContent[], runtime: AgentRuntime): Promise<string[]> {
+		const dir = join(app.getPath("temp"), "pideck-images");
+		await mkdir(dir, { recursive: true });
+		// 顺手清理 7 天前的旧图，防止目录无限膨胀（失败不影响本次落盘）
+		try {
+			const now = Date.now();
+			const cutoff = now - 7 * 24 * 60 * 60 * 1000;
+			for (const name of readdirSync(dir)) {
+				const full = join(dir, name);
+				try {
+					if (statSync(full).mtimeMs < cutoff) unlinkSync(full);
+				} catch {
+					// 单文件清理失败忽略
+				}
+			}
+		} catch {
+			// 目录读取失败忽略
+		}
+		const shortAgentId = runtime.tab.id.slice(0, 8);
+		const stamp = Date.now();
+		const paths: string[] = [];
+		for (let i = 0; i < images.length; i++) {
+			const mime = (images[i].mimeType ?? "").toLowerCase();
+			const ext = AgentManager.IMAGE_MIME_EXT[mime] ?? "png";
+			const file = join(dir, `img-${shortAgentId}-${stamp}-${i}.${ext}`);
+			await writeFile(file, Buffer.from(images[i].data, "base64"));
+			paths.push(this.wslEnvironment ? toWslLinuxPath(file, this.wslEnvironment) : file);
+		}
+		return paths;
+	}
+
+	/** 生成图片降级提示：给出落盘路径和 img_read 使用指引，避免 agent 盲目猜测图片位置 */
+	private static buildImageDegradeHint(paths: string[], count: number): string {
+		const lines = paths.map((p) => `- ${p}`).join("\n");
+		return (
+			`[PiDeck] 用户粘贴了 ${count} 张图片，当前模型不支持直接查看图片。图片已保存到：\n` +
+			`${lines}\n` +
+			`请使用 img_read 工具读取图片内容（img_read(path="完整路径")），每张图调用一次。` +
+			`若图片较多，先读第一张了解大致内容再决定是否逐张读取。`
+		);
 	}
 
 	/**
@@ -1717,6 +1838,46 @@ export class AgentManager {
 			60_000,
 		);
 		return this.getRuntimeState(agentId);
+	}
+
+	/**
+	 * 打开 agent 后应用用户配置的默认模型（settings.json 的 defaultProvider/defaultModel，
+	 * 与模型选择器「设为默认模型」入口写入同一字段）。
+	 *
+	 * 与当前模型相同时跳过，避免每次打开都多发一次 set_model RPC；
+	 * 未配置默认模型时静默跟随 pi 自身逻辑（models.json 顺序 / 会话恢复）。
+	 * 失败只记日志，不阻塞也不影响 agent 可用性。
+	 */
+	private async applyDefaultModel(
+		agentId: string,
+		currentModel?: { provider?: string; id?: string },
+	): Promise<void> {
+		try {
+			const settings = (await this.configManager.getSettingsConfig()).parsed;
+			const provider =
+				typeof settings.defaultProvider === "string" ? settings.defaultProvider : "";
+			const modelId =
+				typeof settings.defaultModel === "string" ? settings.defaultModel : "";
+			if (!provider || !modelId) return;
+			if (currentModel?.provider === provider && currentModel?.id === modelId) return;
+			const runtime = this.agents.get(agentId);
+			if (!runtime || !runtime.process.isRunning()) return;
+			await runtime.process.client.request(
+				{ type: "set_model", provider, modelId },
+				60_000,
+			);
+			void this.appLogger?.info("agent", "Default model applied on open", {
+				agentId,
+				provider,
+				modelId,
+			});
+			this.emitState();
+		} catch (error) {
+			void this.appLogger?.warn("agent", "Apply default model skipped", {
+				agentId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	/**

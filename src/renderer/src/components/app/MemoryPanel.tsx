@@ -23,6 +23,7 @@ import {
 	Zap,
 } from "lucide-react";
 import type {
+	ExtractionUsageStats,
 	MemoryCategory,
 	MemoryExtractInput,
 	MemoryExtractionEvent,
@@ -43,7 +44,7 @@ type MemoryPanelProps = {
 };
 
 const PRIORITY_LABEL: Record<MemoryPriority, string> = { P0: "P0", P1: "P1", P2: "P2" };
-const CAT_LABEL: Record<MemoryCategory, string> = { memory: "记忆", skill: "技能", resource: "资源" };
+const CAT_LABEL: Record<MemoryCategory, string> = { memory: "记忆", skill: "技能", resource: "资源", profile: "画像" };
 
 /** 相对时间：3d / 7d / 30d */
 function formatAge(ts: number): string {
@@ -95,6 +96,8 @@ type ExtractState =
 export function MemoryPanel(props: MemoryPanelProps) {
 	const [nodes, setNodes] = useState<MemoryNode[]>([]);
 	const [stats, setStats] = useState<MemoryStats | null>(null);
+	// 提取 LLM 消耗统计（今日/累计/分阶段/分模型）
+	const [usage, setUsage] = useState<ExtractionUsageStats | null>(null);
 	const [tab, setTab] = useState<TabKey>("memories");
 	// 记忆 tab 筛选
 	const [priorityFilter, setPriorityFilter] = useState<MemoryPriority | "all">("all");
@@ -136,12 +139,14 @@ export function MemoryPanel(props: MemoryPanelProps) {
 
 	const load = async () => {
 		try {
-			const [list, s] = await Promise.all([
+			const [list, s, u] = await Promise.all([
 				window.piDesktop.memory.list({ scope: "all" }),
 				window.piDesktop.memory.stats(),
+				window.piDesktop.memory.usage(),
 			]);
 			setNodes(list);
 			setStats(s);
+			setUsage(u);
 			const idx = await window.piDesktop.memory.l0Index({ budget: 3200 });
 			setL0Index(idx);
 		} catch (e) {
@@ -440,7 +445,7 @@ export function MemoryPanel(props: MemoryPanelProps) {
 									))}
 								</div>
 								<div className="memory-filter-group">
-									{(["all", "memory", "skill", "resource"] as const).map((c) => (
+									{(["all", "memory", "skill", "resource", "profile"] as const).map((c) => (
 										<button key={c} className={`memory-chip${typeFilter === c ? " active" : ""}`} onClick={() => setTypeFilter(c)}>
 											{c === "all" ? "所有类型" : CAT_LABEL[c]}
 										</button>
@@ -534,14 +539,53 @@ export function MemoryPanel(props: MemoryPanelProps) {
 						</div>
 					</div>
 
+					{/* 提取 LLM 消耗（今日/累计/分阶段/分模型） */}
+					<div className="memory-ctx-card">
+						<div className="memory-ctx-head"><Wand2 size={13} /><strong>提取消耗（LLM）</strong></div>
+						{usage ? (
+							<>
+								<div className="memory-insight-grid">
+									<div className="memory-insight-metric">
+										<span className="metric-value">{usage.today.calls}</span>
+										<span className="metric-label">今日调用</span>
+									</div>
+									<div className="memory-insight-metric">
+										<span className="metric-value">{usage.today.totalTokens.toLocaleString()}</span>
+										<span className="metric-label">今日 tokens</span>
+									</div>
+									<div className="memory-insight-metric accent">
+										<span className="metric-value">{usage.total.calls}</span>
+										<span className="metric-label">累计调用</span>
+									</div>
+								</div>
+								<div className="memory-ctx-expiry">
+									<span className="memory-l0">分阶段</span>
+									<span className="memory-access-count">
+										提取 {usage.byStage.extract?.calls ?? 0} 次 · 去重 {usage.byStage.dedup?.calls ?? 0} 次 · 蒸馏 {usage.byStage.distill?.calls ?? 0} 次
+									</span>
+								</div>
+								{usage.byModel.map((m) => (
+									<div key={`${m.provider}/${m.model}`} className="memory-ctx-expiry">
+										<span className="memory-l0" title={`${m.provider}/${m.model}`}>{m.model}</span>
+										<span className="memory-access-count">{m.calls} 次 · {m.totalTokens.toLocaleString()} tokens</span>
+									</div>
+								))}
+								{usage.total.calls === 0 && <div className="memory-ctx-empty">暂无消耗记录（升级后新提取才会计入）</div>}
+							</>
+						) : (
+							<div className="memory-ctx-empty">消耗统计不可用</div>
+						)}
+					</div>
+
 					{/* 文件系统统计 */}
 					<div className="memory-ctx-card">
 						<div className="memory-ctx-head"><Database size={13} /><strong>Viking 文件系统</strong></div>
-						<div className="memory-insight-grid cols4">
+						<div className="memory-insight-grid cols5">
 							<div className="memory-insight-metric"><span className="metric-value">{stats?.memories ?? 0}</span><span className="metric-label">记忆</span></div>
 							<div className="memory-insight-metric"><span className="metric-value">{stats?.skills ?? 0}</span><span className="metric-label">技能</span></div>
 							<div className="memory-insight-metric"><span className="metric-value">{stats?.experience ?? 0}</span><span className="metric-label">经验</span></div>
 							<div className="memory-insight-metric"><span className="metric-value">{stats?.trajectories ?? 0}</span><span className="metric-label">轨迹</span></div>
+							<div className="memory-insight-metric"><span className="metric-value">{stats?.profiles ?? 0}</span><span className="metric-label">画像</span></div>
 						</div>
 					</div>
 
@@ -631,6 +675,7 @@ export function MemoryPanel(props: MemoryPanelProps) {
 								{ value: "memory", label: "记忆" },
 								{ value: "skill", label: "技能" },
 								{ value: "resource", label: "资源" },
+								{ value: "profile", label: "画像" },
 							]}
 						/>
 						<SelectField

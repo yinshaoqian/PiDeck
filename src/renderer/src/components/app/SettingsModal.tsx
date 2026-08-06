@@ -383,6 +383,23 @@ function SettingsModalContent(props: SettingsModalProps) {
 			.then((pets) => { setPetList(pets); setPetOptions(pets.map((p) => ({ value: p.id, label: p.displayName }))); })
 			.catch(() => undefined);
 	}, []);
+	// 提取模型选项（记忆提取专用模型）：拉取 pi models.json 全部 provider/model，供「跟随默认 / 指定模型」选择
+	const [extractModelOptions, setExtractModelOptions] = useState<{ value: string; label: string; provider: string; model: string }[]>([]);
+	useEffect(() => {
+		window.piDesktop.config
+			.getModels()
+			.then((res) => {
+				const providers = (res.parsed.providers ?? {}) as Record<string, { models?: Array<{ id?: string; name?: string }> }>;
+				const opts: { value: string; label: string; provider: string; model: string }[] = [];
+				for (const [pname, p] of Object.entries(providers)) {
+					for (const m of p.models ?? []) {
+						if (m.id) opts.push({ value: `${pname}/${m.id}`, label: `${pname} · ${m.id}`, provider: pname, model: m.id });
+					}
+				}
+				setExtractModelOptions(opts);
+			})
+			.catch(() => undefined);
+	}, []);
 	// 进入开发设置 tab 时，若 piStatus 为空则自动检测（避免每次需手动点击「检测环境」）
 	useEffect(() => {
 		if (activeTab === "dev" && props.piStatus === null && !props.piChecking) {
@@ -807,6 +824,30 @@ function SettingsModalContent(props: SettingsModalProps) {
 											</small>
 										</div>
 									)}
+									<div className="setting-field">
+										<span>
+											{t("settings.memoryExtractionModel")}
+											<DirtyMarker dirty={isDirty("memoryExtractionModel")} label={t("settings.memoryExtractionModel")} />
+										</span>
+										<SelectField
+											value={draftSettings.memoryExtractionModel ? `${draftSettings.memoryExtractionModel.provider}/${draftSettings.memoryExtractionModel.model}` : "default"}
+											options={[
+												{ value: "default", label: t("settings.memoryExtractionModelDefault") },
+												...extractModelOptions.map((o) => ({ value: o.value, label: o.label })),
+											]}
+											onChange={(value) => {
+												if (value === "default") {
+													updateDraft({ memoryExtractionModel: null });
+												} else {
+													const opt = extractModelOptions.find((o) => o.value === value);
+													if (opt) updateDraft({ memoryExtractionModel: { provider: opt.provider, model: opt.model } });
+												}
+											}}
+										/>
+										<small style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
+											{t("settings.memoryExtractionModelDesc")}
+										</small>
+									</div>
 								</SettingsSection>
 								<SettingsSection title={t("settings.git")}>
 									<SettingSwitch

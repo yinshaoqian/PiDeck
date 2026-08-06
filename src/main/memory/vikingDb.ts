@@ -50,6 +50,19 @@ CREATE TABLE IF NOT EXISTS extracted_sessions (
   extracted_at INTEGER NOT NULL
 );
 
+-- LLM 提取消耗统计：每次提取/去重/蒸馏调用记录 tokens（用户要求可查看消耗）。
+-- 只增不删（周期性的清理由 runLifecycle 控制，保留最近 30 天）。
+CREATE TABLE IF NOT EXISTS extraction_usage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at INTEGER NOT NULL,
+  stage TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_extraction_usage_at ON extraction_usage(at);
+
 CREATE INDEX IF NOT EXISTS idx_viking_nodes_category ON viking_nodes(category);
 CREATE INDEX IF NOT EXISTS idx_viking_nodes_priority ON viking_nodes(priority);
 CREATE INDEX IF NOT EXISTS idx_viking_nodes_parent_dir ON viking_nodes(parent_dir);
@@ -141,6 +154,85 @@ export class VikingDb {
       .prepare("SELECT 1 FROM extracted_sessions WHERE session_id = ?")
       .get(sessionId);
     return Boolean(row);
+  }
+
+  // ── 提取消耗统计（LLM usage） ────────────────────────
+
+  recordUsage(rec: { at: number; stage: string; provider: string; model: string; promptTokens: number; completionTokens: number }): void {
+    this.ensureOpen()
+      .prepare("INSERT INTO extraction_usage (at, stage, provider, model, prompt_tokens, completion_tokens) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(rec.at, rec.stage, rec.provider, rec.model, Math.max(0, rec.promptTokens | 0), Math.max(0, rec.completionTokens | 0));
+  }
+
+  /** 提取消耗汇总：今日/累计/分阶段/分模型 + 最近 20 条明细 */
+  getUsageStats(): {
+    today: { calls: number; promptTokens: number; completionTokens: number; totalTokens: number };
+    total: { calls: number; promptTokens: number; completionTokens: number; totalTokens: number };
+    byStage: Record<string, { calls: number; promptTokens: number; completionTokens: number }>;
+    byModel: Array<{ provider: string; model: string; calls: number; promptTokens: number; completionTokens: number; totalTokens: number }>;
+    recent: Array<{ id: number; at: number; stage: string; provider: string; model: string; promptTokens: number; completionTokens: number }>;
+  } {
+    const db = this.ensureOpen();
+    const dayStart = new Date().setHours(0, 0, 0, 0);
+    const sum = (rows: Array<{ calls: number; prompt_tokens: number; completion_tokens: number }>) =>
+      rows.reduce(
+        (acc, r) => ({
+          calls: acc.calls + Number(r.calls ?? 0),
+          promptTokens: acc.promptTokens + Number(r.prompt_tokens ?? 0),
+          completionTokens: acc.completionTokens + Number(r.completion_tokens ?? 0),
+        }),
+        { calls: 0, promptTokens: 0, completionTokens: 0 },
+      );
+    const todayRows = db
+      .prepare("SELECT COUNT(*) calls, SUM(prompt_tokens) prompt_tokens, SUM(completion_tokens) completion_tokens FROM extraction_usage WHERE at >= ?")
+      .get(dayStart) as { calls: number; prompt_tokens: number; completion_tokens: number };
+    const totalRows = db
+      .prepare("SELECT COUNT(*) calls, SUM(prompt_tokens) prompt_tokens, SUM(completion_tokens) completion_tokens FROM extraction_usage")
+      .get() as { calls: number; prompt_tokens: number; completion_tokens: number };
+    const stageRows = db
+      .prepare("SELECT stage, COUNT(*) calls, SUM(prompt_tokens) prompt_tokens, SUM(completion_tokens) completion_tokens FROM extraction_usage GROUP BY stage")
+      .all() as Array<{ stage: string; calls: number; prompt_tokens: number; completion_tokens: number }>;
+    const modelRows = db
+      .prepare("SELECT provider, model, COUNT(*) calls, SUM(prompt_tokens) prompt_tokens, SUM(completion_tokens) completion_tokens FROM extraction_usage GROUP BY provider, model ORDER BY calls DESC")
+      .all() as Array<{ provider: string; model: string; calls: number; prompt_tokens: number; completion_tokens: number }>;
+    const recent = db
+      .prepare("SELECT id, at, stage, provider, model, prompt_tokens, completion_tokens FROM extraction_usage ORDER BY id DESC LIMIT 20")
+      .all() as Array<{ id: number; at: number; stage: string; provider: string; model: string; prompt_tokens: number; completion_tokens: number }>;
+    const mk = (r: { calls: number; prompt_tokens: number; completion_tokens: number }) => ({
+      calls: Number(r.calls ?? 0),
+      promptTokens: Number(r.prompt_tokens ?? 0),
+      completionTokens: Number(r.completion_tokens ?? 0),
+    });
+    return {
+      today: { ...mk(todayRows), totalTokens: Number(todayRows.prompt_tokens ?? 0) + Number(todayRows.completion_tokens ?? 0) },
+      total: { ...mk(totalRows), totalTokens: Number(totalRows.prompt_tokens ?? 0) + Number(totalRows.completion_tokens ?? 0) },
+      byStage: Object.fromEntries(stageRows.map((r) => [r.stage, mk(r)])),
+      byModel: modelRows.map((r) => ({
+        provider: r.provider,
+        model: r.model,
+        calls: Number(r.calls ?? 0),
+        promptTokens: Number(r.prompt_tokens ?? 0),
+        completionTokens: Number(r.completion_tokens ?? 0),
+        totalTokens: Number(r.prompt_tokens ?? 0) + Number(r.completion_tokens ?? 0),
+      })),
+      recent: recent.map((r) => ({
+        id: Number(r.id),
+        at: Number(r.at),
+        stage: r.stage,
+        provider: r.provider,
+        model: r.model,
+        promptTokens: Number(r.prompt_tokens ?? 0),
+        completionTokens: Number(r.completion_tokens ?? 0),
+      })),
+    };
+  }
+
+  /** 清理 30 天前的消耗记录（防表无限膨胀），返回删除数 */
+  purgeOldUsage(now = Date.now()): number {
+    const r = this.ensureOpen()
+      .prepare("DELETE FROM extraction_usage WHERE at < ?")
+      .run(now - 30 * 24 * 60 * 60 * 1000);
+    return Number(r.changes);
   }
 
   // ── 节点 CRUD ─────────────────────────────────────────
@@ -301,6 +393,7 @@ export class VikingDb {
     memories: number;
     skills: number;
     resources: number;
+    profiles: number;
     byPriority: Record<string, number>;
     expiringSoon: number;
   } {
@@ -312,7 +405,7 @@ export class VikingDb {
       (db.prepare("SELECT COUNT(*) c FROM viking_nodes WHERE expires_at IS NOT NULL AND expires_at <= ? AND expires_at > ?")
         .get(Date.now() + 24 * 60 * 60 * 1000, Date.now()) as { c: number }).c
     );
-    const cat = { memories: 0, skills: 0, resources: 0 };
+    const cat = { memories: 0, skills: 0, resources: 0, profiles: 0 };
     for (const row of byCat) cat[row.category as keyof typeof cat] = Number(row.c);
     const prio: Record<string, number> = { P0: 0, P1: 0, P2: 0 };
     for (const row of byPrio) prio[row.priority] = Number(row.c);
