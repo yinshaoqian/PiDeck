@@ -660,6 +660,14 @@ export function App() {
   } | null>(null);
   /** 只读查看的会话消息（readSessionDisplayMessages 直接读文件构造，毫秒级） */
   const [readonlyMessages, setReadonlyMessages] = useState<ChatMessage[]>([]);
+  /**
+   * 只读子会话是否仍「活跃」（JSONL 仍在持续增长）。运行中的子 agent 会话文件
+   * 会不断追加消息；完成后停止增长。用于决定最后一条 run 是否保持展开——
+   * 避免工具完成→思考间隙被折叠、下个工具再展开的反复闪烁。
+   */
+  const [readonlyActive, setReadonlyActive] = useState(false);
+  /** 最近一次观察到会话内容增长的时间戳（轮询签名变化时更新） */
+  const readonlyLastGrowthRef = useRef(0);
   /** 任务锚（Task Anchor）：全局任务列表（三态 doing/review/done），持久化 + Agent 联动 */
   const [taskAnchors, setTaskAnchors] = useState<TaskAnchorItem[]>([]);
   const [editingTaskAnchor, setEditingTaskAnchor] = useState(false);
@@ -1857,15 +1865,26 @@ export function App() {
     if (!viewer) return;
     let cancelled = false;
     let lastSig = "";
+    // 首读不算「内容增长」：打开已完成会话时首读必然触发签名变化，
+    // 若记为增长会误判 30s 活跃，最后一条 run 以运行态展开后才折叠。
+    let firstRead = true;
     const readAndUpdate = async () => {
       try {
         const msgs = await api.sessions.readChatMessages(viewer.sessionPath);
         if (cancelled || !msgs) return;
         const sig = readonlyMessagesSignature(msgs);
         if (sig !== lastSig) {
+          const isFirst = firstRead;
+          firstRead = false;
           lastSig = sig;
+          // 内容有增长 → 会话仍在运行；供最后一条 run 保持展开的判断使用
+          if (!isFirst) {
+            readonlyLastGrowthRef.current = Date.now();
+          }
           setReadonlyMessages(msgs);
         }
+        // 30s 窗口：停止写入后（子 agent 完成/中断）判为不活跃，最后一条 run 折叠回概要
+        setReadonlyActive(Date.now() - readonlyLastGrowthRef.current < 30_000);
       } catch {
         /* 会话文件读取失败静默 */
       }
@@ -1882,16 +1901,6 @@ export function App() {
     ? runtimeStateByAgent[activeAgentId]
     : undefined;
   const activeRuntimeState = agentRuntimeState;
-  const activeProjectHasBusyAgent = Boolean(
-    activeProjectId && displayAgents.some((agent) =>
-      agent.projectId === activeProjectId && (
-        agent.status === "starting" ||
-        agent.status === "running" ||
-        runtimeStateByAgent[agent.id]?.isStreaming ||
-        runtimeStateByAgent[agent.id]?.isExecutingTool
-      ),
-    ),
-  );
   // 历史首屏控制在 50 条，避免打开旧会话时同步解析过多 Markdown/KaTeX。
   const {
     visibleMessages: paginatedMessages,
@@ -2905,10 +2914,10 @@ export function App() {
       void refreshProjectSessions(activeProjectId, true).catch(() => undefined);
     };
     scheduleRefresh();
-    if (!activeProjectHasBusyAgent) {
-      return () => { disposed = true; };
-    }
-
+    // 无论 agent 是否 busy 都周期扫描：async 后台子 agent 派出后父 agent 很快回到
+    // idle，但子会话 JSONL 要等子进程冷启动完成才创建（可能几十秒）；若只在 busy
+    // 时扫描，侧栏会永远错过这类后台子会话。单项目扫描已是毫秒级，展开项目 3s
+    // 一次的开销可接受。
     // 子会话由扩展直接写盘，运行期间保留低频兜底；工具 start/end 不应重置计时器并触发额外扫描。
     // 15s→3s：配合 SessionScanner 分区预过滤（单项目扫描已从秒级降到毫秒级），
     // 让并行子 Agent 完成后 3 秒内出现在左侧列表，不再等 8 个全做完才可见。
@@ -2917,7 +2926,7 @@ export function App() {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [activeProjectId, activeProjectHasBusyAgent, expandedSidebarProjects]);
+  }, [activeProjectId, expandedSidebarProjects]);
 
   function getComposerMaxHeight() {
     const chatPane = chatPaneRef.current;
@@ -3138,7 +3147,7 @@ export function App() {
     }
   }, [sessionSourceFilter]);
 
-  // 切换 Agent 时重置滚动状态，确保回到该 Agent 时自动滚到底部。
+  // 切换 Agent / 打开只读子会话时重置滚动状态，确保回到该 Agent 时自动滚到底部。
   // 历史命令已由当前分支按 Agent 隔离，不恢复 dev 旧的全局 commandHistory 持久化。
   useEffect(() => {
     setAutoScroll(true);
@@ -3152,23 +3161,7 @@ export function App() {
       }
     });
     return () => cancelAnimationFrame(frame);
-  }, [activeAgentId]);
-
-
-  // 切换 Agent 时重置滚动状态，确保回到该 Agent 时自动滚到底部
-  useEffect(() => {
-    setAutoScroll(true);
-    autoScrollRef.current = true;
-    setShowScrollToBottom(false);
-    // 延迟一帧滚动：等 React 完成渲染、DOM 更新后再滚到底部
-    const frame = requestAnimationFrame(() => {
-      const timeline = timelineRef.current;
-      if (timeline) {
-        timeline.scrollTo({ top: timeline.scrollHeight, behavior: "instant" });
-      }
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [activeAgentId]);
+  }, [activeAgentId, readonlyViewer?.sessionPath]);
 
   // 监听用户滚动,判断是否需要显示"移动到最新"按钮
   useEffect(() => {
@@ -3239,7 +3232,7 @@ export function App() {
     resizeObserver.observe(messageList);
 
     return () => resizeObserver.disconnect();
-  }, [activeAgentId, autoScroll, activeAgent?.status, activeMessages.length]);
+  }, [activeAgentId, autoScroll, activeAgent?.status, activeMessages.length, readonlyViewer?.sessionPath, readonlyMessages.length]);
 
   // 加载更多历史消息后，按顶部锁定的方式恢复滚动位置。
   // 历史消息会插入到 .message-list 顶部，若不补偿新增高度，浏览器保持原 scrollTop 会导致视图跳动，
@@ -4751,7 +4744,22 @@ export function App() {
   // 无 agent 时模型列表缓存，避免每次打开模型选择器都 fork pi --list-models
   const cachedModelsRef = useRef<AvailableModel[] | null>(null);
 
+  /** 当前默认模型 key（provider/modelId）：模型选择器「设为默认」入口的选中态 */
+  const [defaultModelKey, setDefaultModelKey] = useState("");
+
   async function openModelPicker() {
+    // 每次打开都刷新默认模型标记，保证与 pi settings.json 的最新配置一致
+    void api.config
+      .getSettings()
+      .then((result) => {
+        const parsed = (result.parsed ?? {}) as { defaultProvider?: string; defaultModel?: string };
+        if (parsed.defaultProvider && parsed.defaultModel) {
+          setDefaultModelKey(`${parsed.defaultProvider}/${parsed.defaultModel}`);
+        } else {
+          setDefaultModelKey("");
+        }
+      })
+      .catch(() => undefined);
     // 有 agent → 走 RPC 路径获取可用模型
     if (activeAgentId && !isPendingAgentId(activeAgentId)) {
       const models = await api.agents.availableModels(activeAgentId);
@@ -4847,6 +4855,26 @@ export function App() {
       isNowFavorite ? t("app.modelFavorited", { name: modelId }) : t("app.modelUnfavorited", { name: modelId }),
       1500,
     );
+  }
+
+  /**
+   * 把模型设为「打开会话时默认使用」：写入 pi settings.json 的 defaultProvider/defaultModel。
+   * 主进程在 agent 启动收敛后按此配置自动 set_model，历史会话恢复同样生效。
+   */
+  async function setDefaultModel(provider: string, modelId: string) {
+    try {
+      const result = await api.config.getSettings();
+      const parsed = (result.parsed ?? {}) as Record<string, unknown>;
+      await api.config.saveSettings({
+        ...parsed,
+        defaultProvider: provider,
+        defaultModel: modelId,
+      });
+      setDefaultModelKey(`${provider}/${modelId}`);
+      showToast(t("app.modelDefaultSaved", { name: modelId }), 2000);
+    } catch {
+      showToast(t("app.modelDefaultSaveFailed"), 2500);
+    }
   }
 
   async function cycleThinking() {
@@ -5746,6 +5774,11 @@ export function App() {
         throw new PromptDeliveryUnknownError(result.error);
       }
       throw new Error(result.error);
+    }
+    // 图片降级：当前模型不支持视觉输入，主进程已把图片落盘并提示 agent 用 img_read 读取，
+    // 告知用户，避免误以为图片丢失。
+    if (result.accepted && result.degradedImages) {
+      showToast(t("app.imageDegraded", { count: result.imageCount ?? 0 }), 4000);
     }
   }
 
@@ -7831,16 +7864,28 @@ export function App() {
               </div>
             ) : (
               <div className="message-list">
-                {readonlyRuns.map((item) => {
+                {readonlyRuns.map((item, index) => {
                   if (item.kind === "agent-run") {
+                    // 运行中的子会话：只要会话仍在写入（readonlyActive）或含「运行中」
+                    // 工具卡片，最后一条 run 就保持展开，让用户能看到正在执行的工具
+                    // 和思考流动，而不是工具间隙反复折叠/展开闪烁；会话停止增长
+                    // 30s 后（完成/中断）自动折叠回概要。
+                    const hasRunningTool = item.items.some(
+                      (i) => i.kind === "tool-group" &&
+                        i.messages.some((m) => m.meta?.status === "running"),
+                    );
+                    const isLastRun = index === readonlyRuns.length - 1;
                     return (
                       <TurnRow
-                        key={item.id}
+                        // 用 run 起点做 key 而非 run.id：轮询追加新消息会让 run.id
+                        // 变化（消息 id 拼接），导致 TurnRow 反复重挂载、用户的展开/
+                        // 折叠操作被重置；startedAt 在同一 run 内追加时保持不变。
+                        key={`readonly-run:${item.startedAt}`}
                         run={item}
                         onPreviewImage={setPreviewImage}
                         showThinking={settings.showThinking}
                         isStreaming={false}
-                        agentRunning={false}
+                        agentRunning={hasRunningTool || (isLastRun && readonlyActive)}
                         onOpenExternal={(url) => api.app.openExternal(url)}
                         onOpenFile={openFilePath}
                         onDiffFile={diffFilePath}
@@ -10244,6 +10289,8 @@ export function App() {
           onPick={selectModel}
           favoriteModels={settings.favoriteModels}
           onToggleFavorite={toggleFavoriteModel}
+          defaultModelKey={defaultModelKey}
+          onSetDefault={setDefaultModel}
         />
       )}
       {composerModePickerOpen && (

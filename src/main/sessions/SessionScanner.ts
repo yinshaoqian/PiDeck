@@ -739,13 +739,19 @@ export class SessionScanner {
    *  - assistant 消息：extractMessageText + extractThinkingRaw
    *  - toolResult 消息：配对前面的 toolCall 生成工具卡片
    *  - compactionSummary：生成系统消息
+   *
+   * 运行中的子会话（如 pi-subagents 子 agent）JSONL 持续追加，工具执行期间
+   * toolCall 已落盘而 toolResult 未写入（可能持续数秒到数分钟），此时要渲染
+   * 成 running 状态的工具卡片（spinner），而不是把执行中的工具静默丢弃。
    */
   async readChatMessages(filePath: string): Promise<ChatMessage[]> {
     const raw = await this.readSessionRawText(filePath);
     const lines = raw.split(/\r?\n/).filter(Boolean);
 
-    // 第一遍：收集所有 toolCall，用于 toolResult 配对
+    // 第一遍：收集所有 toolCall（用于 toolResult 配对），并标记已有配对结果的 toolCallId。
+    // 没有配对的 toolCall 对应「正在执行的工具」——工具结果可能在下一轮轮询才落盘。
     const toolCallsMap = new Map<string, { name: string; args: unknown }>();
+    const toolCallsWithResult = new Set<string>();
     for (const line of lines) {
       try {
         const entry = JSON.parse(line) as Record<string, unknown>;
@@ -760,6 +766,8 @@ export class SessionScanner {
                 }
               }
             }
+          } else if (msg?.role === "toolResult" && msg.toolCallId != null) {
+            toolCallsWithResult.add(String(msg.toolCallId));
           }
         }
       } catch { /* skip */ }
@@ -791,16 +799,50 @@ export class SessionScanner {
           });
         } else if (msg.role === "assistant") {
           const text = extractMessageText(msg.content);
-          if (!text.trim()) continue;
           const thinking = extractThinkingRaw(msg.content);
-          messages.push({
-            id: `sv-a-${seq++}`,
-            agentId: "_viewer",
-            role: "assistant",
-            text,
-            timestamp: ts,
-            ...(thinking ? { thinking } : {}),
-          });
+          // 只读时间线允许「仅思考、正文未到」的消息进入：子 agent 运行中大部分
+          // 输出是 thinking 块（文本块要等思考结束才落盘），过滤掉会让界面看起来
+          // 「一直没更新」。纯 toolCall 消息（text/thinking 都为空）也继续往下走，
+          // 用于生成运行中的工具卡片。
+          if (!text.trim() && !thinking.trim() && !this.hasToolCall(msg.content)) continue;
+          if (text.trim() || thinking.trim()) {
+            messages.push({
+              id: `sv-a-${seq++}`,
+              agentId: "_viewer",
+              role: "assistant",
+              text,
+              timestamp: ts,
+              ...(thinking ? { thinking } : {}),
+            });
+          }
+          // 运行中工具：toolCall 已落盘但 toolResult 未写入 → 生成 running 卡片，
+          // 与 AgentManager.upsertToolMessage 的 running 态展示一致（spinner + 工具名）。
+          // toolResult 到达后，下一轮轮询会把它替换成 done/error 卡片，位置不变。
+          if (Array.isArray(msg.content)) {
+            for (const block of msg.content) {
+              const typed = block as Record<string, unknown>;
+              if (typed?.type !== "toolCall" || typed.id == null) continue;
+              const callId = String(typed.id);
+              if (toolCallsWithResult.has(callId)) continue;
+              const toolName = String(typed.name ?? "tool");
+              const rawArgs = typed.arguments != null ? JSON.stringify(typed.arguments) : undefined;
+              messages.push({
+                id: `sv-t-${seq++}`,
+                agentId: "_viewer",
+                role: "tool",
+                text: `▶ ${toolName}`,
+                timestamp: ts,
+                meta: {
+                  status: "running",
+                  toolName,
+                  toolCallId: callId,
+                  startedAt: ts,
+                  // 截断避免超大 args（如完整文件内容）把会话元数据撑爆
+                  ...(rawArgs ? { args: rawArgs.length > 800 ? `${rawArgs.slice(0, 800)}…` : rawArgs } : {}),
+                },
+              });
+            }
+          }
         } else if (msg.role === "toolResult") {
           const toolCallId = String(msg.toolCallId ?? `sv-tool-${seq}`);
           const historicalCall = toolCallsMap.get(toolCallId);
@@ -824,7 +866,17 @@ export class SessionScanner {
       } catch { /* skip malformed lines */ }
     }
 
-    return messages.filter((m: ChatMessage) => m.text.trim());
+    // thinking-only 消息靠 thinking 字段保留（text 为空是正常形态，不是坏数据）
+    return messages.filter((m: ChatMessage) => m.text.trim() || m.thinking?.trim());
+  }
+
+  /** 判断消息 content 是否包含 toolCall 块（用于保留纯工具调用的 assistant 消息）。 */
+  private hasToolCall(content: unknown): boolean {
+    if (!Array.isArray(content)) return false;
+    return content.some((item) => {
+      if (!item || typeof item !== "object") return false;
+      return (item as Record<string, unknown>).type === "toolCall";
+    });
   }
 
   /** 从 content 数组中提取图片附件 */
@@ -982,6 +1034,9 @@ export class SessionScanner {
     return undefined;
   }
 
+  /** 子会话运行状态的「会话感知」时间窗口：文件停止写入超过该时长视为不再运行 */
+  private static readonly SUBAGENT_FRESH_WINDOW_MS = 60_000;
+
   private async readSummary(filePath: string, signal?: AbortSignal): Promise<SessionSummary | null> {
     // 先读取轻量文件指纹；未变化时复用摘要，避免周期扫描反复读取和解析全部 JSONL。
     const isWsl = this.isWslPath(filePath);
@@ -990,7 +1045,22 @@ export class SessionScanner {
       : await stat(filePath);
     const version = { mtimeMs: info.mtimeMs, size: info.size };
     const cached = this.summaryCache.get(filePath, version);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) {
+      // 会话感知过期重判：缓存按 mtime+size 命中（文件未变化），但「running」依赖当前时间——
+      // 子 agent 进程退出后文件停止写入，60s 后应转为 completed。缓存无 TTL，若不重判，
+      // 中断/无标记完成的子会话徽标会永久显示 running。
+      if (
+        cached &&
+        cached.parentSessionPath &&
+        cached.subagentStatus === "running" &&
+        Date.now() - version.mtimeMs >= SessionScanner.SUBAGENT_FRESH_WINDOW_MS
+      ) {
+        const refreshed: SessionSummary = { ...cached, subagentStatus: "completed" };
+        this.summaryCache.set(filePath, version, refreshed);
+        return refreshed;
+      }
+      return cached;
+    }
 
     const raw = isWsl
       ? await this.readWslFile(filePath, signal)
@@ -1063,8 +1133,13 @@ export class SessionScanner {
         if (text && preview === "空会话") preview = text;
         if (text && message.role === "user" && !firstUserText) firstUserText = text;
         if (text && message.role === "assistant" && !firstAssistantText) firstAssistantText = text;
-        // 持续跟踪最后一条 assistant 消息；子会话完成汇报的状态标记（✅/⚠️/❌）位于其中
-        if (message.role === "assistant" && text) lastAssistantText = text;
+        // 持续跟踪最后一条 assistant 消息；子会话完成汇报的状态标记（✅/⚠️/❌）位于其中。
+        // 只取真正的 text 块：thinking-only 消息（运行中思考）提取出的 thinking 内容
+        // 不算「汇报文本」，否则子 agent 刚创建发出第一条思考就被误判为已完成。
+        if (message.role === "assistant") {
+          const plainText = this.extractPlainText(message.content).trim();
+          if (plainText) lastAssistantText = plainText;
+        }
       }
     }
 
@@ -1139,19 +1214,38 @@ export class SessionScanner {
     const inferredName = this.cleanTitle(latestSessionInfoName) || this.cleanTitle(name) || this.cleanTitle(firstUserText) || this.cleanTitle(firstAssistantText) || "Untitled";
 
     // 子会话运行状态标记：仅对判定为子会话的文件计算。
-    // pi-subagents 约定子 agent 汇报格式包含 ✅ 已完成 / ⚠️ 需关注 / ❌ 失败；
-    // 无 assistant 回复说明刚派发还在运行。非子会话不设该字段。
+    // pi-subagents 约定子 agent 汇报格式包含 ✅ 已完成 / ⚠️ 需关注 / ❌ 失败。
+    // 「会话感知」基于文件 mtime 新鲜度：子 agent 进程运行期间 JSONL 持续写入
+    // （thinking 也是流式落盘的），完成后进程退出、文件停止增长。
+    // 因此 mtime 新鲜 = 仍在运行（即使最后一条只是中间回复、没有汇报标记），
+    // 避免出现「创建即显示已完成」的误判。
     let subagentStatus: SessionSummary["subagentStatus"];
     if (parentSessionPath) {
+      // 60s 窗口：覆盖思考间隙的短暂静默；完成/中断后文件停止写入自然过期
+      const fresh = Date.now() - info.mtimeMs < SessionScanner.SUBAGENT_FRESH_WINDOW_MS;
       if (!lastAssistantText) {
-        subagentStatus = "running";
-      } else if (lastAssistantText.includes("❌")) {
-        subagentStatus = "failed";
-      } else if (lastAssistantText.includes("⚠️")) {
-        subagentStatus = "attention";
+        // 无任何正文回复：mtime 新鲜 = 刚派发还在运行；陈旧 = 异常中断（无完成汇报）
+        subagentStatus = fresh ? "running" : "completed";
       } else {
-        // 有回复但无显式标记：视为完成（汇报格式约定必有标记，此处兜底）
-        subagentStatus = "completed";
+        // 优先解析 pi-subagents 完成汇报模板的「状态」行（> **状态**：✅ 已完成）。
+        // 不能用全文 includes 搜索 ❌/⚠️：审查/报告类正文会引用这些符号
+        //（如「无 ✅/⚠️/❌ 标记时」），导致成功的汇报被误判为 failed。
+        // 状态行可能是纯文本「状态：✅」或 Markdown 粗体「**状态**：✅」。
+        const statusMarks = [...lastAssistantText.matchAll(/状态\*{0,2}[：:]\s*(✅|⚠️|❌)/g)];
+        const lastMark = statusMarks.length > 0 ? statusMarks[statusMarks.length - 1][1] : undefined;
+        if (lastMark === "✅") {
+          subagentStatus = "completed";
+        } else if (lastMark === "⚠️") {
+          subagentStatus = "attention";
+        } else if (lastMark === "❌") {
+          subagentStatus = "failed";
+        } else if (fresh) {
+          // 无汇报模板（非 pi-subagents 扩展的子会话）：文件仍在写入 → 还在执行任务
+          subagentStatus = "running";
+        } else {
+          // 有回复、文件已停止写入且无显式标记：视为完成（兜底）
+          subagentStatus = "completed";
+        }
       }
     }
 
@@ -1213,6 +1307,21 @@ export class SessionScanner {
         if (item && typeof item === "object") return String((item as any).text ?? (item as any).thinking ?? "");
         return "";
       }).filter(Boolean).join(" ");
+    }
+    return "";
+  }
+
+  /**
+   * 只提取 content 中的纯 text 块（不含 thinking/toolCall）。
+   * 用于子会话完成汇报判定：thinking 内容是运行中的思考过程，不是最终回复。
+   */
+  private extractPlainText(content: unknown): string {
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      return content
+        .filter((item) => item && typeof item === "object" && (item as any).type === "text")
+        .map((item) => String((item as any).text ?? ""))
+        .join("");
     }
     return "";
   }
